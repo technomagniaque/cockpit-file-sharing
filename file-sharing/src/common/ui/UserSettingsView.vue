@@ -147,6 +147,16 @@ const tabVisibilityOptions: SelectMenuOption<TabVisibility>[] = [
           :options="tabVisibilityOptions"
         />
       </InputLabelWrapper>
+      <div class="text-header">ksmbd</div>
+      <InputLabelWrapper>
+        <template #label>
+          {{ _("ksmbd Tab Visibility") }}
+        </template>
+        <SelectMenu
+          v-model="tempUserSettings.ksmbd.tabVisibility"
+          :options="tabVisibilityOptions"
+        />
+      </InputLabelWrapper>
     </div>
     <template #footer>
       <div class="button-group-row justify-end">

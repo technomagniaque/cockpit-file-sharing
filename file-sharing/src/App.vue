@@ -20,6 +20,7 @@ import { useUserSettings } from "@/common/user-settings";
 import { ResultAsync, ok } from "neverthrow";
 import { BashCommand, Directory, getServer } from "@45drives/houston-common-lib";
 import S3ManagementMain from "./tabs/s3Management/ui/S3ManagementMain.vue";
+import KsmbdTabMain from "./tabs/ksmbd/ui/KsmbdTabMain.vue";
 import { isMinioAvailable } from "@/tabs/s3Management/api/minioCliAdapter";
 import { isRustfsAvailable } from "@/tabs/s3Management/api/rustfsCliAdapter";
 import { isGarageHealthy } from "@/tabs/s3Management/api/garageCliAdapter";
@@ -35,6 +36,7 @@ const showSambaTab = ref<boolean | undefined>(undefined);
 const showNfsTab = ref<boolean | undefined>(undefined);
 const showIscsiTab = ref<boolean | undefined>(undefined);
 const showS3Tab = ref<boolean | undefined>(undefined);
+const showKsmbdTab = ref<boolean | undefined>(undefined);
 
 const sambaConfigured = (): ResultAsync<boolean, never> => {
   return getServer()
@@ -53,6 +55,15 @@ const nfsConfigured = (): ResultAsync<boolean, never> => {
 const iscsiConfigured = (): ResultAsync<boolean, never> => {
   return getServer()
     .andThen((server) => new Directory(server, "/sys/kernel/scst_tgt").exists({ superuser: "try" }))
+    .orElse((_) => ok(false));
+};
+
+const ksmbdConfigured = (): ResultAsync<boolean, never> => {
+  return getServer()
+    .andThen((server) =>
+      server.execute(new BashCommand("command -v ksmbd.mountd || modinfo ksmbd >/dev/null 2>&1"))
+    )
+    .map((_) => true)
     .orElse((_) => ok(false));
 };
 
@@ -161,6 +172,21 @@ globalProcessingWrapPromise(useUserSettings(true)).then((userSettings) => {
           );
           break;
       }
+      switch (userSettings.ksmbd.tabVisibility) {
+        case "always":
+          showKsmbdTab.value = true;
+          break;
+        case "never":
+          showKsmbdTab.value = false;
+          break;
+        case "auto":
+          globalProcessingWrapPromise(
+            ksmbdConfigured()
+              .map((value) => (showKsmbdTab.value = value))
+              .unwrapOr(null)
+          );
+          break;
+      }
       switch (userSettings.s3.tabVisibility) {
         case "always":
           showS3Tab.value = true;
@@ -192,6 +218,14 @@ const visibleTabs = computed<HoustonAppTabEntry[]>(() => [
         },
       ]
     : []),
+  ...(showKsmbdTab.value
+    ? [
+        {
+          label: "ksmbd",
+          component: KsmbdTabMain,
+        },
+      ]
+    : []),
   ...(showNfsTab.value
     ? [
         {
@@ -219,7 +253,7 @@ const visibleTabs = computed<HoustonAppTabEntry[]>(() => [
 ]);
 
 const loading = computed<boolean>(() =>
-  [showSambaTab, showNfsTab, showIscsiTab, showS3Tab].some((s) => s.value === undefined)
+  [showSambaTab, showNfsTab, showIscsiTab, showS3Tab, showKsmbdTab].some((s) => s.value === undefined)
 );
 </script>
 

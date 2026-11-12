@@ -28,6 +28,12 @@ export type UserSettings = {
     tabVisibility: TabVisibility;
   };
   /**
+   * ksmbd (serveur SMB3 du noyau)
+   */
+  ksmbd: {
+    tabVisibility: TabVisibility;
+  };
+  /**
    * iSCSI-specific settings
    */
   iscsi: {
@@ -61,6 +67,9 @@ const defaultSettings = (): UserSettings => ({
     tabVisibility: "auto",
   },
   s3: {
+    tabVisibility: "auto",
+  },
+  ksmbd: {
     tabVisibility: "auto",
   },
   iscsi: {
@@ -99,6 +108,9 @@ const configFileReadPromise = new Promise<Ref<UserSettings>>((resolve) => {
           },
           s3: {
             tabVisibility: contents.s3?.tabVisibility || defaultSettings().s3.tabVisibility,
+          },
+          ksmbd: {
+            tabVisibility: contents.ksmbd?.tabVisibility || defaultSettings().ksmbd.tabVisibility,
           },
           iscsi: {
             // confPath: contents.iscsi?.confPath || defaultSettings().iscsi.confPath,
