@@ -108,7 +108,7 @@ Kerberos passe par `gssproxy.service` et `/etc/gssproxy/24-nfs-server.conf`.
   `-o vers=3,proto=rdma,port=20049`. Le port 20049 est déjà le défaut avec `proto=rdma`
   (`fs/nfs/fs_context.c` `NFS_RDMA_PORT`). `nconnect` **reste accepté** avec RDMA (`fs/nfs/nfs4client.c`,
   identique en 6.12) ; `READ_PLUS` est désactivé sur RDMA (`fs/nfs/client.c`).
-- **Cohabitation avec ksmbd SMB Direct** : ksmbd écoute en RDMA sur 5445 en Linux 6.12 (`SMB_DIRECT_PORT = 5445`, iWARP comme RoCE / IB) et, sur les noyaux plus récents, sur un unique port (445 en IB / RoCE seul, 5445 dès qu'un adaptateur iWARP est présent)
+- **Cohabitation avec ksmbd SMB Direct** : depuis le commit cb097b3d (bien avant 6.12), ksmbd écoute en RDMA sur un seul port : 445 (InfiniBand / RoCE), ou 5445 pour tous dès qu'un RNIC iWARP est présent ; les noyaux qui ont le correctif 214220e7 (Metzmacher, `rdma_restrict_node_type`) écoutent sur les deux, 445 pour IB / RoCE et 5445 pour iWARP
   (`fs/smb/server/transport_rdma.c`) : aucun conflit avec 20049, mêmes interfaces RDMA possibles.
 
 ## Options d'export contrôlées

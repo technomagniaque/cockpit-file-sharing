@@ -37,9 +37,12 @@
  *    __write_ports_addxprt) ; côté client, proto=rdma prend le port 20049 par
  *    défaut (fs/nfs/fs_context.c NFS_RDMA_PORT) et nconnect reste accepté avec
  *    RDMA (fs/nfs/nfs4client.c).
- *  - ksmbd SMB Direct écoute en RDMA sur 5445 en Linux 6.12 (SMB_DIRECT_PORT,
- *    iWARP comme RoCE / IB) et, sur les noyaux plus récents, sur un unique port
- *    (445 en IB / RoCE seul, 5445 dès qu'un adaptateur iWARP est présent)
+ *  - ksmbd SMB Direct (fs/smb/server/transport_rdma.c) : depuis cb097b3d
+ *    (« set 445 port to smbdirect port by default », bien avant 6.12), un seul
+ *    port d'écoute RDMA : 445 (InfiniBand / RoCE), ou 5445 pour tous dès qu'un
+ *    RNIC iWARP est présent. Les noyaux qui ont le correctif 214220e7
+ *    (Metzmacher, rdma_restrict_node_type) écoutent sur les deux : 445 pour
+ *    IB / RoCE et 5445 pour iWARP
  *    (fs/smb/server/transport_rdma.c) : aucun conflit avec NFS/RDMA 20049.
  */
 import type { NFSExport } from "./data-types";
@@ -489,8 +492,8 @@ export function analyzeRdma(state: ServerState): Finding[] {
   if (state.portlist !== undefined && !listeners.length) f.push({ level: "warning", title: "nfsd n'écoute pas en RDMA", detail: `rdma=y dans nfs.conf mais /proc/fs/nfsd/portlist ne contient pas de ligne « rdma » (${parsePortlist(state.portlist).map((l) => l.transport + " " + l.port).join(", ") || "vide"}).`, fix: "systemctl restart nfs-server (après modprobe rpcrdma) ; ou à chaud : echo 'rdma 20049' > /proc/fs/nfsd/portlist", ref: "fs/nfsd/nfsctl.c __write_ports_addxprt" });
   else if (listeners.length) f.push({ level: "info", title: "NFS/RDMA à l'écoute", detail: listeners.map((l) => `${l.transport} ${l.port}`).join(", ") + ". Valable pour NFSv3 et NFSv4.1 ; mountd, statd et lockd (v3) restent en TCP / UDP." });
   const types = Object.values(state.rdmaNodeTypes ?? {});
-  if (types.includes("iwarp")) f.push({ level: "info", title: "iWARP", detail: "En iWARP, l'espace de ports RDMA est celui de TCP : 20049/tcp doit être libre et autorisé (ksmbd SMB Direct utilise 5445 en iWARP et en 6.12 : pas de conflit)." });
-  if (types.includes("ib-roce")) f.push({ level: "info", title: "RoCE / InfiniBand", detail: "En RoCEv2 le trafic passe par 4791/udp (traité par la carte) ; ksmbd SMB Direct écoute dans l'espace de ports RDMA sur 5445 en Linux 6.12 (et sur les noyaux plus récents : 445 en IB/RoCE seul, ou 5445 dès qu'un adaptateur iWARP est présent), sans conflit avec 20049. RoCE exige un réseau sans perte (PFC / ECN) sur le switch." });
+  if (types.includes("iwarp")) f.push({ level: "info", title: "iWARP", detail: "En iWARP, l'espace de ports RDMA est celui de TCP : 20049/tcp doit être libre et autorisé (ksmbd SMB Direct utilise 5445 en iWARP : pas de conflit)." });
+  if (types.includes("ib-roce")) f.push({ level: "info", title: "RoCE / InfiniBand", detail: "En RoCEv2 le trafic passe par 4791/udp (traité par la carte) ; ksmbd SMB Direct écoute dans l'espace de ports RDMA sur 445 (ou sur 5445 si un RNIC iWARP est aussi présent, sauf noyaux avec le correctif 214220e7 qui écoutent sur les deux), sans conflit avec 20049. RoCE exige un réseau sans perte (PFC / ECN) sur le switch." });
   f.push({ level: "info", title: "Montage côté client", detail: "Linux : mount -t nfs -o vers=4.1,proto=rdma serveur:/chemin /mnt (port 20049 par défaut avec proto=rdma) ; NFSv3 : -o vers=3,proto=rdma. nconnect reste accepté avec RDMA (plusieurs connexions RDMA).", ref: "fs/nfs/fs_context.c NFS_RDMA_PORT ; fs/nfs/nfs4client.c nconnect" });
   return f;
 }

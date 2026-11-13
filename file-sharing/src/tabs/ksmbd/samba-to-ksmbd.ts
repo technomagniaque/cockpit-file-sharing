@@ -672,7 +672,7 @@ export function convertSambaToKsmbd(sambaDoc: IniDocument, opts: ConversionOptio
       "grep -E 'CONFIG_SMB_SERVER(_SMBDIRECT)?=' /boot/config-$(uname -r)",
       "rdma link show            # le port doit être ACTIVE (qedr pour la QL41112)",
       "ibv_devinfo               # paquet rdma-core / ibverbs-utils (Debian 13)",
-      "# Port SMB Direct : 5445 en Linux 6.12 (iWARP comme RoCE/IB) ; sur noyaux récents : 445 en IB/RoCE seul, 5445 dès qu'un RNIC iWARP est présent",
+      "# Port SMB Direct : 445 en InfiniBand / RoCE ; 5445 dès qu'un RNIC iWARP est présent (iWARP = espace de ports TCP, à ouvrir au pare-feu)",
       "nft add rule inet filter input tcp dport 5445 accept 2>/dev/null || { firewall-cmd --permanent --add-port=5445/tcp && firewall-cmd --reload; }",
     );
   }
