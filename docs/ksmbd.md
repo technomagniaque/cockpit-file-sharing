@@ -12,6 +12,7 @@ Code : `file-sharing/src/tabs/ksmbd/`
 | `permission-stack.ts` | modèle de l'empilement : connexion, identité, création, couches d'accès |
 | `samba-to-ksmbd.ts` | conversion avec rapport ligne par ligne |
 | `ksmbd-manager.ts` | accès serveur (ksmbd.conf, Samba, comptes, sondes RDMA / noyau / ZFS) |
+| `rdma-sge.ts` | limite SGE de SMB Direct (ksmbd exige `max_send_sge >= 6`, qedr n'en a que 4) |
 | `ui/*.vue` | onglet, éditeur de paramètres, simulateur, conversion |
 | `ksmbd.test.ts` | tests vitest des modules purs |
 
@@ -67,6 +68,7 @@ Connexion en lecture seule → toute écriture refusée ; puis DACL NT (`securit
 - `map to guest = bad password` est désactivé dans le code.
 - `max connections` en [global] plafonne **tout le serveur** (défaut 256) et n'est pas propagé ; dans un partage, défaut 128.
 - `interfaces` attend des **noms** de netdev, pas des adresses.
+- **SMB Direct exige `max_send_sge >= 6`** (`SMB_DIRECT_MAX_SEND_SGES`, contrôle de d1626940 ; le client cifs exige la même valeur) : ksmbd refuse sinon le périphérique (`smb_direct: device <dev> max_send_sge/max_recv_sge = 4/4 too small`). C'est le cas de `qedr` (QLogic FastLinQ QL41xxx) : SMB Direct y est impossible, NFS/RDMA reste possible. La sonde lit `max_sge` (`ibv_devinfo -v`, paquet ibverbs-utils) et ce message dans dmesg, et l'onglet l'affiche.
 - **`ksmbd.control --reload` ne relit que les partages** : un changement de [global] (RDMA, multicanal, interfaces, signature, protocole, durable handles…) exige `systemctl restart ksmbd` (= `ksmbd.control --shutdown` puis `ksmbd.mountd`). L'onglet le détecte et propose le redémarrage.
 
 ## Conversion Samba → ksmbd

@@ -8,6 +8,7 @@ import KsmbdPermissionSimulator from "./KsmbdPermissionSimulator.vue";
 import SambaConversion from "./SambaConversion.vue";
 import SmbDialects from "./SmbDialects.vue";
 import { KsmbdManager, type KsmbdProbe } from "../ksmbd-manager";
+import { smbDirectSgeIssues, SMB_DIRECT_MIN_SEND_SGE } from "../rdma-sge";
 import { parseIni, serializeIni, findSection, type IniDocument } from "../ini";
 import type { UserDb } from "../permission-stack";
 import { NFSv4Manager, type NfsServerSnapshot } from "@/tabs/nfs/nfsv4-manager";
@@ -188,6 +189,7 @@ const envIssues = computed(() => {
   if (!p.toolsInstalled) out.push("ksmbd-tools absent (ksmbd.mountd introuvable : apt install ksmbd-tools).");
   if (p.sambaRunning) out.push("Samba est actif : arrêtez smb/smbd avant de démarrer ksmbd (port 445).");
   if (p.smbdirectBuilt === "n") out.push("CONFIG_SMB_SERVER_SMBDIRECT absent : pas de RDMA possible avec ce noyau.");
+  out.push(...smbDirectSgeIssues(p.rdmaSge ?? [], p.sgeRejection));
   if (!p.timeMachineCapable) out.push(`Time Machine via ksmbd exige Linux 7.3 ou plus (actuel : ${p.kernel}).`);
   return out;
 });
@@ -200,7 +202,7 @@ const envIssues = computed(() => {
       <div v-if="probe" class="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
         <div><span class="text-muted">Noyau</span> <span class="font-mono">{{ probe.kernel }}</span></div>
         <div><span class="text-muted">Module</span> {{ probe.moduleLoaded ? "chargé" : probe.moduleAvailable ? "disponible" : "absent" }}</div>
-        <div><span class="text-muted">SMB Direct</span> CONFIG={{ probe.smbdirectBuilt }}, {{ probe.rdmaLinks.length }} lien(s) RDMA</div>
+        <div><span class="text-muted">SMB Direct</span> CONFIG={{ probe.smbdirectBuilt }}, {{ probe.rdmaLinks.length }} lien(s) RDMA<template v-if="probe.rdmaSge?.length"> — max_send_sge : {{ probe.rdmaSge.map((s) => `${s.dev}=${s.maxSge}${s.maxSge < SMB_DIRECT_MIN_SEND_SGE ? " (< " + SMB_DIRECT_MIN_SEND_SGE + ")" : ""}`).join(", ") }}</template></div>
         <div><span class="text-muted">ksmbd-tools</span> {{ probe.toolsInstalled ? probe.toolsVersion || "installé" : "absent" }}</div>
         <div class="col-span-2"><span class="text-muted">OpenZFS</span> <span class="font-mono">{{ probe.zfsVersion || "—" }}</span></div>
         <div><span class="text-muted">ksmbd.mountd</span> {{ probe.mountdRunning ? "actif" : "arrêté" }}</div>

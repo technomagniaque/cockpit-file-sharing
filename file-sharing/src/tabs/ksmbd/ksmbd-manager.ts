@@ -6,6 +6,7 @@
 import { BashCommand, File, server as defaultServer, unwrap, type Server } from "@45drives/houston-common-lib";
 import type { UserDb } from "./permission-stack";
 import { findSection, parseIni, serializeIni } from "./ini";
+import { parseIbvDevinfoSge, parseSgeRejection, type RdmaSge } from "./rdma-sge";
 
 export const KSMBD_CONF = "/etc/ksmbd/ksmbd.conf";
 export const KSMBD_PWDDB = "/etc/ksmbd/ksmbdpwd.db";
@@ -30,6 +31,10 @@ export interface KsmbdProbe {
   confExists: boolean;
   sambaRunning: boolean;
   rdmaLinks: { dev: string; port: string; state: string; netdev: string }[];
+  /** max_sge par périphérique RDMA (ibv_devinfo -v) ; vide si ibverbs-utils absent */
+  rdmaSge: RdmaSge[];
+  /** refus de SMB Direct par ksmbd vu dans dmesg (SGE insuffisants) */
+  sgeRejection?: { dev: string; send: number; recv: number };
   netdevs: { name: string; state: string; driver: string; speed: string }[];
   zfsVersion: string;
   timeMachineCapable: boolean;
@@ -143,6 +148,8 @@ echo "zfs=$(zfs version 2>/dev/null | head -1)"
 kt=$(pgrep -x kthreadd 2>/dev/null | head -1); [ -n "$kt" ] || kt=2
 echo "umask=$(awk '/^Umask:/{print $2}' /proc/$kt/status 2>/dev/null)"
 command -v rdma >/dev/null && rdma -j link show 2>/dev/null | sed 's/^/rdma=/'
+command -v ibv_devinfo >/dev/null && ibv_devinfo -v 2>/dev/null | grep -E '^hca_id:|^[[:space:]]*max_sge:' | sed 's/^/ibv=/'
+dmesg 2>/dev/null | grep -E 'max_send_sge/max_recv_sge = [0-9]+/[0-9]+ too small' | tail -1 | sed 's/^/sgerej=/'
 for d in /sys/class/infiniband/*; do
   [ -d "$d" ] || continue
   dev=$(basename "$d")
@@ -163,6 +170,8 @@ done
     const nets: KsmbdProbe["netdevs"] = [];
     const sysLinks: KsmbdProbe["rdmaLinks"] = [];
     let rdmaJson = "";
+    let ibvText = "";
+    let sgeRej = "";
     for (const line of r.out.split("\n")) {
       const i = line.indexOf("=");
       if (i < 0) continue;
@@ -175,6 +184,8 @@ done
         const [dev, port, state, netdev] = v.split("|");
         if (dev && port) sysLinks.push({ dev, port, state: (state ?? "").trim(), netdev: (netdev ?? "").trim() });
       } else if (k === "rdma") rdmaJson += v;
+      else if (k === "ibv") ibvText += v + "\n";
+      else if (k === "sgerej") sgeRej = v;
       else kv[k] = v;
     }
     let rdmaLinks: KsmbdProbe["rdmaLinks"] = [];
@@ -201,6 +212,8 @@ done
       sambaRunning: kv.samba === "1",
       zfsVersion: kv.zfs ?? "",
       rdmaLinks,
+      rdmaSge: parseIbvDevinfoSge(ibvText),
+      sgeRejection: parseSgeRejection(sgeRej),
       netdevs: nets,
       timeMachineCapable: major > 7 || (major === 7 && minor >= 3),
       workerUmask: /^[0-7]{3,4}$/.test(kv.umask ?? "") ? parseInt(kv.umask!, 8) : null,
