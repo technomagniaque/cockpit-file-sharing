@@ -156,7 +156,7 @@ const signingValue = tristate;
 const encryptValue = tristate;
 
 function userList(key: string): Converter {
-  return (v, ctx) => {
+  return (v, _ctx) => {
     const notes: string[] = [];
     const out: string[] = [];
     // Samba accepte des entrées entre guillemets contenant des espaces ;

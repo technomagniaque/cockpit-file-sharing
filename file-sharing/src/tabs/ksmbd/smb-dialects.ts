@@ -144,7 +144,7 @@ export function toggleDialect(r: DialectRange, d: SmbDialect, on: boolean, trimT
     const nlo = Math.min(lo, i);
     const nhi = Math.max(hi, i);
     const range: DialectRange = { min: ORDER[nlo]!, max: ORDER[nhi]! };
-    const added = ORDER.slice(nlo, nhi + 1).filter((x, k) => nlo + k < lo || nlo + k > hi);
+    const added = ORDER.slice(nlo, nhi + 1).filter((_x, k) => nlo + k < lo || nlo + k > hi);
     const extra = added.filter((x) => x !== d);
     return { ok: true, range, alsoDisabled: [], lostClients: [], message: extra.length ? `Plage contiguë : ${extra.join(", ")} sont aussi activés.` : `${d} activé.` };
   }

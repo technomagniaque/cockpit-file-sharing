@@ -86,7 +86,8 @@ export class KsmbdManager {
     const needsRestart = globalOf(previous) !== globalOf(text);
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const backup = `${this.confPath}.bak-${stamp}`;
-    await this.run('mkdir -p -- "$(dirname -- "$1")" && { [ ! -f "$1" ] || cp -a -- "$1" "$2"; }', [this.confPath, backup]);
+    const cp = await this.run('mkdir -p -- "$(dirname -- "$1")" && { [ ! -f "$1" ] || cp -a -- "$1" "$2"; }', [this.confPath, backup]);
+    if (cp.code !== 0) throw new Error(`Copie de sauvegarde impossible (${backup}) : ${cp.err.trim() || "code " + cp.code} — ksmbd.conf non modifié`);
     const content = text.endsWith("\n") ? text : text + "\n";
     const file = new File(this.server, this.confPath);
     await unwrap(file.exists({ superuser: "try" }).andThen((exists) => (exists ? file.replace(content, { superuser: "try" }) : file.create(true, { superuser: "try" }).andThen((f) => f.replace(content, { superuser: "try" })))));
