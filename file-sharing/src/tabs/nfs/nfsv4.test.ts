@@ -1,6 +1,6 @@
 import { suite, test, expect } from "vitest";
 import {
-  getNfsConf, setNfsConf, applyV41OnlyPreset, applyV3V41Preset, applyRdma, parseProcVersions, configuredVersions,
+  getNfsConf, setNfsConf, nfsConfValue, applyV41OnlyPreset, applyV3V41Preset, applyRdma, parseProcVersions, configuredVersions,
   analyzeServer, analyzeExportV41, analyzeExportV3, analyzeRdma, parsePortlist, firewallPorts, setVersions,
   versionGuards, currentVersions, exportLineFor, clientMountCommands, overriddenKeys,
 } from "./nfsv4";
@@ -49,6 +49,15 @@ suite("nfs.conf", () => {
     expect(getNfsConf(withSep, "nfsd", "vers4.1")).toBe("y");
     const t3 = setNfsConf(withSep, "nfsd", "rdma", "y");
     expect(t3.indexOf("rdma=y")).toBeLessThan(t3.indexOf("# Section mountd"));
+  });
+  test("valeurs : commentaire en ligne seulement après un blanc, guillemets respectés", () => {
+    expect(nfsConfValue("y ; commentaire")).toBe("y");
+    expect(nfsConfValue("y # commentaire")).toBe("y");
+    expect(nfsConfValue("a#b;c")).toBe("a#b;c");
+    expect(nfsConfValue('"x # y"')).toBe("x # y");
+    expect(nfsConfValue('"x;y" # commentaire')).toBe("x;y");
+    expect(nfsConfValue("  32  ")).toBe("32");
+    expect(getNfsConf("[mountd]\nmanage-gids=y#pas un commentaire\n", "mountd", "manage-gids")).toBe("y#pas un commentaire");
   });
   test("suppression = retour au défaut (commenté)", () => {
     const t = setNfsConf(sample, "nfsd", "vers4.1", undefined);

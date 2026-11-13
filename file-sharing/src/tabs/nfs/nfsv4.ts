@@ -95,6 +95,18 @@ interface NfsConfLine {
   commented?: boolean;
 }
 
+/**
+ * Valeur d'une ligne clé = valeur : une valeur entre guillemets est prise telle
+ * quelle (commentaire éventuel après les guillemets ignoré) ; sinon un
+ * commentaire en ligne n'est retiré que s'il est précédé d'un blanc, pour ne
+ * pas couper une valeur qui contient « # » ou « ; ».
+ */
+export function nfsConfValue(raw: string): string {
+  const q = /^"([^"]*)"(?:\s*[#;].*)?\s*$/.exec(raw);
+  if (q) return q[1]!;
+  return raw.replace(/\s+[#;].*$/, "").trim();
+}
+
 function scan(text: string): NfsConfLine[] {
   let section = "";
   return text.replace(/\r\n?/g, "\n").split("\n").map((raw) => {
@@ -106,9 +118,7 @@ function scan(text: string): NfsConfLine[] {
     }
     const kv = /^([#;]\s*)?([A-Za-z0-9._-]+)\s*=\s*(.*?)\s*$/.exec(t);
     if (kv && section) {
-      let val = kv[3]!.replace(/\s*[#;].*$/, "").trim();
-      if (/^".*"$/.test(kv[3]!)) val = kv[3]!.slice(1, -1);
-      return { raw, section, key: kv[2]!.toLowerCase(), value: val, commented: !!kv[1] };
+      return { raw, section, key: kv[2]!.toLowerCase(), value: nfsConfValue(kv[3]!), commented: !!kv[1] };
     }
     return { raw, section };
   });
