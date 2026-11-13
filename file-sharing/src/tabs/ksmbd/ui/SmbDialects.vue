@@ -57,7 +57,11 @@ function set(p: KsmbdParam, v: string) {
 <template>
   <div class="space-y-3 text-sm">
     <div class="rounded-lg border border-default p-3">
-      <div class="text-label">Dialectes SMB — plage active : {{ range.min }} → {{ range.max }}</div>
+      <div class="text-label">
+        Dialectes SMB — plage active :
+        <template v-if="range.empty"><span class="text-danger">vide (aucun client accepté)</span></template>
+        <template v-else>{{ range.min }} → {{ range.max }}</template>
+      </div>
       <p class="text-xs text-muted">
         ksmbd n'a que « server min protocol » et « server max protocol » : seule une plage contiguë est possible.
         SMB1 n'existe pas dans ksmbd ; « SMB2_22 » n'est pas un dialecte (joker de négociation). Changement global : redémarrage complet de ksmbd.
@@ -86,6 +90,9 @@ function set(p: KsmbdParam, v: string) {
           <li v-for="c in last.lostClients" :key="c">Ne pourront plus se connecter — {{ c }}</li>
         </ul>
       </div>
+      <ul v-if="range.notes?.length" class="list-disc pl-5 text-xs mt-2" :class="range.empty ? 'text-danger' : 'text-warning'">
+        <li v-for="n in range.notes" :key="n">{{ n }}</li>
+      </ul>
       <ul v-if="warnings.length" class="list-disc pl-5 text-xs text-warning mt-2">
         <li v-for="w in warnings" :key="w">{{ w }}</li>
       </ul>

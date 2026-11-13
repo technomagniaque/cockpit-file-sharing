@@ -3,16 +3,23 @@
  * chose que ksmbd sait faire, une PLAGE CONTIGUË « server min protocol » …
  * « server max protocol ».
  *
- * Vérifié dans le noyau (fs/smb/server/smb_common.c, identique en v6.12) :
+ * Vérifié dans le noyau (fs/smb/server/smb_common.c et smb_common.h,
+ * identiques en v6.12 et HEAD sur ces points) :
+ *  - indices : SMB21_PROT=2, SMB2X_PROT=3, SMB30_PROT=4, SMB302_PROT=5,
+ *    SMB311_PROT=6 ; défauts min = 2, max = 6 (ksmbd_min/max_protocol).
  *  - dialectes SMB2+ négociables : SMB2_10, SMB3_00, SMB3_02, SMB3_11
- *    (smb2_protos[]) ; SMB2.0.2 n'existe pas dans ksmbd.
+ *    (smb2_protos[]) ; SMB2.0.2 et SMB1 n'existent pas dans ksmbd.
  *  - « SMB2_22 » (SMB2X_PROT, « SMB 2.??? ») n'est pas un dialecte : c'est le
- *    joker de la négociation multi-protocole lancée en SMB1, toujours accepté
- *    (supported_protocol). En min, son index (3) exclut SMB2_10 : équivaut à
- *    SMB3_00.
- *  - ksmbd_lookup_protocol_idx compare par préfixe de la valeur saisie : on
- *    écrit toujours le nom complet.
- *  - supported_protocol : min_protocol <= idx <= max_protocol.
+ *    joker de la négociation multi-protocole lancée en SMB1. Son indice 3
+ *    vaut SMB3_00 en minimum (exclut SMB2_10) et SMB2_10 en maximum.
+ *  - ksmbd_lookup_protocol_idx : strncmp(valeur, nom, strlen(valeur)), donc
+ *    la valeur est un PRÉFIXE du nom, sensible à la casse ; smb1_protos est
+ *    parcouru en premier (du dernier au premier), puis smb2_protos (du dernier
+ *    au premier). « SMB » ou « SMB2 » donnent donc SMB2X (3), « SMB3_0 »
+ *    donne SMB3_02. Une valeur non reconnue (-1) est ignorée : la borne garde
+ *    son défaut (transport_ipc.c ipc_server_config_on_startup).
+ *  - supported_protocol : min_protocol <= idx <= max_protocol. Si min > max,
+ *    aucun dialecte n'est accepté (pas d'inversion automatique).
  */
 import { findSection, getValue, setValue, deleteValue, type IniDocument } from "./ini";
 
@@ -27,38 +34,84 @@ export interface DialectInfo {
 
 export const SMB_DIALECTS: DialectInfo[] = [
   { id: "SMB2_10", label: "SMB 2.1", brings: "Baux (leases) de fichiers, MTU étendu. Pas de chiffrement, pas de multicanal.", clients: "Windows 7 / Server 2008 R2, vieux NAS, imprimantes et scanners « scan to folder », Android anciens, certaines TV." },
-  { id: "SMB3_00", label: "SMB 3.0", brings: "Multicanal, SMB Direct (RDMA), chiffrement AES-CCM, poignées durables / persistantes.", clients: "Windows 8 / Server 2012." },
-  { id: "SMB3_02", label: "SMB 3.0.2", brings: "Améliorations RDMA (invalidation à distance), désactivation possible de SMB1 côté client.", clients: "Windows 8.1 / Server 2012 R2." },
-  { id: "SMB3_11", label: "SMB 3.1.1", brings: "Intégrité de pré-authentification (protection contre la rétrogradation), chiffrement AES-GCM (plus rapide), signature AES-GMAC selon le client, compression.", clients: "Windows 10 / 11 / Server 2016+, macOS récents, Linux cifs, smbclient." },
+  { id: "SMB3_00", label: "SMB 3.0", brings: "Multicanal, SMB Direct (RDMA), chiffrement AES-CCM, signature AES-CMAC. Pas de poignées persistantes annoncées en 3.0 par ksmbd.", clients: "Windows 8 / Server 2012." },
+  { id: "SMB3_02", label: "SMB 3.0.2", brings: "Améliorations RDMA (invalidation à distance). Noyau 6.12 : poignées persistantes annoncées seulement avec « durable handles = yes » (absentes des noyaux récents).", clients: "Windows 8.1 / Server 2012 R2." },
+  { id: "SMB3_11", label: "SMB 3.1.1", brings: "Intégrité de pré-authentification (protection contre la rétrogradation), chiffrement AES-GCM (plus rapide). Signature : HMAC-SHA256 / AES-CMAC seulement (pas d'AES-GMAC dans ksmbd). Compression : absente en 6.12 (UEK8), seulement noyaux 7.x. Noyau 6.12 : poignées persistantes avec « durable handles = yes ».", clients: "Windows 10 / 11 / Server 2016+, macOS récents, Linux cifs, smbclient." },
 ];
 
 const ORDER: SmbDialect[] = SMB_DIALECTS.map((d) => d.id);
 
-function idx(d: string | undefined, fallback: SmbDialect): number {
-  if (!d) return ORDER.indexOf(fallback);
-  const v = d.trim().toUpperCase();
-  if (v.startsWith("SMB2_22")) return 1; // joker SMB2X : exclut SMB2_10 en min
-  const exact = ORDER.indexOf(v as SmbDialect);
-  if (exact >= 0) return exact;
-  // préfixe, comme ksmbd_lookup_protocol_idx (dernier dialecte correspondant)
-  for (let i = ORDER.length - 1; i >= 0; i--) if (ORDER[i]!.startsWith(v)) return i;
-  return ORDER.indexOf(fallback);
+/** Indices du noyau (smb_common.h). */
+const KIDX: Record<SmbDialect, number> = { SMB2_10: 2, SMB3_00: 4, SMB3_02: 5, SMB3_11: 6 };
+const SMB1_PROTOS: [string, number][] = [["SMB2_10", 2], ["SMB2_22", 3]];
+const SMB2_PROTOS: [string, number][] = [["SMB2_10", 2], ["SMB3_00", 4], ["SMB3_02", 5], ["SMB3_11", 6]];
+
+/**
+ * Émulation exacte de ksmbd_lookup_protocol_idx : indice noyau, ou -1 si la
+ * valeur n'est reconnue par aucun nom (comparaison sensible à la casse, la
+ * valeur doit être un préfixe du nom ; smb1_protos puis smb2_protos, chaque
+ * table parcourue de la fin vers le début).
+ */
+export function kernelProtocolIdx(value: string): number {
+  const str = value;
+  if (!str) return -1;
+  for (const table of [SMB1_PROTOS, SMB2_PROTOS]) {
+    for (let i = table.length - 1; i >= 0; i--) {
+      const [name, index] = table[i]!;
+      if (name.startsWith(str)) return index;
+    }
+  }
+  return -1;
+}
+
+function dialectsBetween(minIdx: number, maxIdx: number): SmbDialect[] {
+  return ORDER.filter((d) => KIDX[d] >= minIdx && KIDX[d] <= maxIdx);
 }
 
 export interface DialectRange {
   min: SmbDialect;
   max: SmbDialect;
+  /** plage vide (min > max après résolution) : aucun client accepté */
+  empty?: boolean;
+  /** remarques sur la lecture (valeur ignorée, joker, préfixe…) */
+  notes?: string[];
+}
+
+function resolveBound(raw: string | undefined, kind: "min" | "max", notes: string[]): number {
+  const def = kind === "min" ? 2 : 6;
+  // ksmbd-tools transmet la valeur telle quelle (après coupure au premier « ; » / « # ») ; seul un espace final est ôté par le parseur
+  const v = raw?.trim() ?? "";
+  if (!v) return def;
+  const k = kernelProtocolIdx(v);
+  const label = `server ${kind} protocol = ${v}`;
+  if (k < 0) {
+    notes.push(`${label} : ignoré par ksmbd (aucun dialecte ne commence par « ${v} », comparaison sensible à la casse) — la borne garde son défaut (${kind === "min" ? "SMB2_10" : "SMB3_11"}).`);
+    return def;
+  }
+  if (k === 3) notes.push(`${label} : joker SMB2X (indice 3) — vaut SMB3_00 en minimum et SMB2_10 en maximum.`);
+  else {
+    const exact = ORDER.find((d) => KIDX[d] === k)!;
+    if (exact !== v) notes.push(`${label} : lu par ksmbd comme ${exact} (préfixe).`);
+  }
+  return k;
 }
 
 export function readRange(doc: IniDocument): DialectRange {
   const g = findSection(doc, "global");
-  let lo = idx(getValue(g, "server min protocol"), "SMB2_10");
-  let hi = idx(getValue(g, "server max protocol"), "SMB3_11");
-  if (lo > hi) [lo, hi] = [hi, lo];
-  return { min: ORDER[lo]!, max: ORDER[hi]! };
+  const notes: string[] = [];
+  const lo = resolveBound(getValue(g, "server min protocol"), "min", notes);
+  const hi = resolveBound(getValue(g, "server max protocol"), "max", notes);
+  const list = dialectsBetween(lo, hi);
+  if (!list.length) {
+    notes.push("Plage vide : le minimum dépasse le maximum, ksmbd n'accepte aucun dialecte (aucune inversion automatique).");
+    // bornes indicatives pour l'interface ; enabledDialects renverra []
+    return { min: ORDER.find((d) => KIDX[d] >= lo) ?? "SMB3_11", max: [...ORDER].reverse().find((d) => KIDX[d] <= hi) ?? "SMB2_10", empty: true, notes };
+  }
+  return { min: list[0]!, max: list[list.length - 1]!, notes };
 }
 
 export function enabledDialects(r: DialectRange): SmbDialect[] {
+  if (r.empty) return [];
   return ORDER.slice(ORDER.indexOf(r.min), ORDER.indexOf(r.max) + 1);
 }
 
@@ -79,6 +132,10 @@ export interface ToggleResult {
  * « trimTowards » indique de quel côté couper (le côté coupé est alors listé).
  */
 export function toggleDialect(r: DialectRange, d: SmbDialect, on: boolean, trimTowards?: "low" | "high"): ToggleResult {
+  if (r.empty) {
+    if (on) return { ok: true, range: { min: d, max: d }, alsoDisabled: [], lostClients: [], message: `Plage vide corrigée : ${d} seul.` };
+    return { ok: true, range: r, alsoDisabled: [], lostClients: [], message: `${d} est déjà inactif (plage vide).` };
+  }
   const lo = ORDER.indexOf(r.min);
   const hi = ORDER.indexOf(r.max);
   const i = ORDER.indexOf(d);
@@ -86,7 +143,7 @@ export function toggleDialect(r: DialectRange, d: SmbDialect, on: boolean, trimT
   if (on) {
     const nlo = Math.min(lo, i);
     const nhi = Math.max(hi, i);
-    const range = { min: ORDER[nlo]!, max: ORDER[nhi]! };
+    const range: DialectRange = { min: ORDER[nlo]!, max: ORDER[nhi]! };
     const added = ORDER.slice(nlo, nhi + 1).filter((x, k) => nlo + k < lo || nlo + k > hi);
     const extra = added.filter((x) => x !== d);
     return { ok: true, range, alsoDisabled: [], lostClients: [], message: extra.length ? `Plage contiguë : ${extra.join(", ")} sont aussi activés.` : `${d} activé.` };
@@ -121,6 +178,7 @@ export function writeRange(doc: IniDocument, r: DialectRange): void {
 export function rangeWarnings(doc: IniDocument, r: DialectRange): string[] {
   const g = findSection(doc, "global");
   const out: string[] = [];
+  if (r.empty) return out;
   const hi = ORDER.indexOf(r.max);
   const multichannel = /^(yes|true|1|enable)/i.test(getValue(g, "server multi channel support") ?? "");
   if (hi < 1 && multichannel) out.push("server multi channel support = yes mais le dialecte max est SMB2_10 : multicanal et SMB Direct (RDMA) exigent SMB3_00 ou plus.");
