@@ -13,48 +13,87 @@
  * plus le calcul du mode et des ACL des objets créés.
  */
 import { findSection, getValue, type IniDocument, type IniSection } from "./ini";
-import { findParam, ksmbdBool, ksmbdList, paramsFor } from "./ksmbd-params";
+import { BROKEN_KEYS, defaultFor, findParamExact, ksmbdBool, ksmbdList, paramsFor } from "./ksmbd-params";
 
 // ------------------------------------------------------------------ configuration effective
 
 export type EffectiveShare = Record<string, { value: string; origin: "share" | "global" | "default" }>;
 
+/** Clés de partage que steal_global_share_conf_kv() ne propage pas depuis [global] (KSMBD_SHARE_CONF_IS_GLOBAL). */
+const NOT_INHERITED = ["guest account", "max connections"];
+/** Clés sans valeur par défaut dans KSMBD_SHARE_DEFCONF (« ; yes » est un commentaire). */
+const NO_DEFAULT = ["read only", "writable", "writeable", "write ok"];
+
 /**
- * Valeur effective de chaque paramètre de partage : section du partage, sinon
- * [global] (les paramètres de partage dans [global] servent de défaut), sinon
- * valeur par défaut de ksmbd-tools. Une valeur vide équivaut à « non défini ».
+ * Valeur effective de chaque paramètre de partage, clé par clé comme
+ * steal_global_share_conf_kv() : section du partage, sinon [global] (les
+ * paramètres de partage dans [global] servent de défaut), sinon défaut de
+ * ksmbd-tools. Les synonymes writable / writeable / write ok sont hérités
+ * séparément. Les clés désactivées (hosts allow/deny, admin users) ne sont
+ * jamais retenues.
  */
 export function effectiveShare(doc: IniDocument, shareName: string): EffectiveShare {
   const share = findSection(doc, shareName);
   const global = findSection(doc, "global");
   const out: EffectiveShare = {};
   for (const p of paramsFor("share")) {
-    const keys = [p.key, ...(p.aliases ?? [])];
-    const fromShare = firstNonEmpty(share, keys);
-    const fromGlobal = p.scope === "share" ? firstNonEmpty(global, keys) : undefined;
+    if (BROKEN_KEYS.includes(p.key)) {
+      out[p.key] = { value: "", origin: "default" };
+      continue;
+    }
+    const fromShare = nonEmpty(share, p.key);
+    const fromGlobal = NOT_INHERITED.includes(p.key) ? undefined : nonEmpty(global, p.key);
     if (fromShare !== undefined) out[p.key] = { value: fromShare, origin: "share" };
     else if (fromGlobal !== undefined) out[p.key] = { value: fromGlobal, origin: "global" };
-    else out[p.key] = { value: p.default, origin: "default" };
+    else out[p.key] = { value: NO_DEFAULT.includes(p.key) ? "" : defaultFor(p, "share"), origin: "default" };
   }
-  // read only a priorité sur writable / writeable / write ok
-  const ro = firstNonEmpty(share, ["read only"]) ?? firstNonEmpty(global, ["read only"]);
-  out["read only"] = ro !== undefined
-    ? { value: ro, origin: firstNonEmpty(share, ["read only"]) !== undefined ? "share" : "global" }
-    : { value: "", origin: "default" };
   return out;
+}
+
+/** Clés désactivées présentes dans le partage ou dans [global]. */
+export function brokenKeysPresent(doc: IniDocument, shareName: string): { key: string; value: string; where: string }[] {
+  const out: { key: string; value: string; where: string }[] = [];
+  for (const [name, where] of [[shareName, "partage"], ["global", "[global]"]] as const) {
+    const sec = findSection(doc, name);
+    for (const k of BROKEN_KEYS) {
+      const v = nonEmpty(sec, k);
+      if (v !== undefined) out.push({ key: k, value: v, where });
+    }
+  }
+  return out;
+}
+
+/**
+ * Lecture du mode d'écriture comme share.c : read only s'il est défini, sinon
+ * le premier défini parmi writable, writeable, write ok (dans cet ordre).
+ * Sans aucun, le partage est en lecture seule (seul WRITABLE compte côté noyau).
+ */
+export function writeMode(eff: EffectiveShare): { writable: boolean; key: string; value: string } {
+  for (const k of ["read only", "writable", "writeable", "write ok"]) {
+    const v = eff[k]?.value;
+    if (v) return { writable: k === "read only" ? !ksmbdBool(v) : ksmbdBool(v), key: k, value: v };
+  }
+  return { writable: false, key: "read only", value: "(non défini : lecture seule)" };
+}
+
+function nonEmpty(section: IniSection | undefined, key: string): string | undefined {
+  const v = getValue(section, key);
+  if (v === undefined) return undefined;
+  const t = v.trim();
+  return t !== "" && !/^[;#]/.test(t) ? t : undefined;
 }
 
 function firstNonEmpty(section: IniSection | undefined, keys: string[]): string | undefined {
   for (const k of keys) {
-    const v = getValue(section, k);
-    if (v !== undefined && v.trim() !== "" && !/^[;#]/.test(v.trim())) return v.trim();
+    const v = nonEmpty(section, k);
+    if (v !== undefined) return v;
   }
   return undefined;
 }
 
 export function globalValue(doc: IniDocument, key: string): string {
   const v = firstNonEmpty(findSection(doc, "global"), [key]);
-  return v ?? findParam(key)?.default ?? "";
+  return v ?? findParamExact(key)?.default ?? "";
 }
 
 // ------------------------------------------------------------------ base d'utilisateurs
@@ -117,7 +156,7 @@ export function resolveUserList(value: string | undefined, db: UserDb): ListReso
 
 // ------------------------------------------------------------------ connexion au partage
 
-export type StepEffect = "pass" | "deny" | "ro" | "rw" | "bind" | "info";
+export type StepEffect = "pass" | "deny" | "ro" | "rw" | "bind" | "info" | "ignored";
 
 export interface StackStep {
   label: string;
@@ -139,7 +178,6 @@ export interface ConnectContext {
 export interface ConnectResult {
   status: "deny" | "ro" | "rw";
   guest: boolean;
-  admin: boolean;
   effectiveAccount: string | null;
   steps: StackStep[];
   warnings: string[];
@@ -151,7 +189,7 @@ export function evaluateTreeConnect(doc: IniDocument, shareName: string, ctx: Co
   const warnings: string[] = [];
   const v = (k: string) => eff[k]?.value ?? "";
   const res = (status: ConnectResult["status"], extra: Partial<ConnectResult> = {}): ConnectResult => ({
-    status, guest: false, admin: false, effectiveAccount: ctx.account, steps, warnings, ...extra,
+    status, guest: false, effectiveAccount: ctx.account, steps, warnings, ...extra,
   });
 
   if (!findSection(doc, shareName)) {
@@ -167,38 +205,22 @@ export function evaluateTreeConnect(doc: IniDocument, shareName: string, ctx: Co
   }
 
   // 1. drapeaux du partage
-  let writable: boolean;
-  const ro = v("read only");
-  if (ro) {
-    writable = !ksmbdBool(ro);
-    steps.push({ label: "Mode du partage", param: "read only", value: ro, effect: writable ? "rw" : "ro", detail: `Départ : ${writable ? "lecture-écriture" : "lecture seule"} (read only prime sur writable)` });
-  } else {
-    const w = v("writable");
-    writable = w ? ksmbdBool(w) : false;
-    steps.push({ label: "Mode du partage", param: w ? "writable" : "read only", value: w || "(défaut : yes)", effect: writable ? "rw" : "ro", detail: `Départ : ${writable ? "lecture-écriture" : "lecture seule"}` });
-  }
+  const wm = writeMode(eff);
+  const writable = wm.writable;
+  steps.push({ label: "Mode du partage", param: wm.key, value: wm.value, effect: writable ? "rw" : "ro", detail: `Départ : ${writable ? "lecture-écriture" : "lecture seule"} (ordre : read only, puis writable, writeable, write ok ; chacun peut être hérité de [global])` });
 
-  // 2. hôtes
-  const allow = ksmbdList(v("hosts allow"));
-  const deny = ksmbdList(v("hosts deny"));
-  if (allow.length) {
-    if (!allow.includes(ctx.peerAddr)) {
-      steps.push({ label: "Hôtes autorisés", param: "hosts allow", value: allow.join(" "), effect: "deny", detail: `${ctx.peerAddr} absent (comparaison exacte, sans CIDR ni préfixe)` });
-      if (allow.some((h) => /[/*]|\.$|^[a-z]/i.test(h))) warnings.push("hosts allow contient un CIDR, un préfixe ou un nom : ksmbd ne compare que des adresses exactes.");
-      return res("deny");
-    }
-    steps.push({ label: "Hôtes autorisés", param: "hosts allow", value: allow.join(" "), effect: "pass", detail: `${ctx.peerAddr} présent : hosts deny n'est pas consulté` });
-  } else if (deny.length) {
-    if (deny.includes(ctx.peerAddr)) {
-      steps.push({ label: "Hôtes refusés", param: "hosts deny", value: deny.join(" "), effect: "deny", detail: `${ctx.peerAddr} refusé` });
-      return res("deny");
-    }
-    steps.push({ label: "Hôtes refusés", param: "hosts deny", value: deny.join(" "), effect: "pass", detail: `${ctx.peerAddr} non listé` });
+  // 2. clés désactivées dans ksmbd-tools : aucun effet
+  for (const b of brokenKeysPresent(doc, shareName)) {
+    steps.push({ label: b.key, param: b.key, value: b.value, effect: "ignored", detail: `Ignoré par ksmbd-tools (KSMBD_SHARE_CONF_IS_BROKEN), défini dans ${b.where}` });
+    warnings.push(b.key === "admin users"
+      ? `admin users (${b.where}) n'a aucun effet dans ksmbd-tools.`
+      : `${b.key} (${b.where}) n'a aucun effet dans ksmbd-tools : la restriction par adresse n'existe pas, filtrez au pare-feu ou avec bind interfaces only.`);
   }
 
   // 3. invités
   const guestOk = ksmbdBool(v("guest ok"));
-  const restrictAnon = Number(globalValue(doc, "restrict anonymous")) || 0;
+  const ra = globalValue(doc, "restrict anonymous").trim();
+  const restrictAnon = ra === "1" || ra === "2" ? Number(ra) : 0;
   if (ctx.guestSession) {
     if (restrictAnon >= 1 && !guestOk) {
       steps.push({ label: "Session anonyme", param: "restrict anonymous", value: String(restrictAnon), effect: "deny", detail: "Session invité refusée (restrict anonymous ≥ 1)" });
@@ -221,7 +243,6 @@ export function evaluateTreeConnect(doc: IniDocument, shareName: string, ctx: Co
   }
 
   const lists: [string, string][] = [
-    ["admin users", "Administrateurs du partage"],
     ["invalid users", "Utilisateurs refusés"],
     ["read list", "Liste lecture seule"],
     ["write list", "Liste écriture"],
@@ -236,15 +257,6 @@ export function evaluateTreeConnect(doc: IniDocument, shareName: string, ctx: Co
   }
   const inList = (k: string) => resolved[k]!.members.includes(ctx.account);
   const show = (k: string) => v(k) || undefined;
-
-  // 5. admin users : court-circuit total (avant invalid users !)
-  if (resolved["admin users"]!.defined) {
-    if (inList("admin users")) {
-      steps.push({ label: "Administrateurs du partage", param: "admin users", value: show("admin users"), effect: "bind", detail: "Membre : connexion acceptée sans consulter invalid users / read list / write list / valid users. Aucun privilège root sur les fichiers." });
-      return res(writable ? "rw" : "ro", { admin: true });
-    }
-    steps.push({ label: "Administrateurs du partage", param: "admin users", value: show("admin users"), effect: "pass", detail: "Non membre" });
-  }
 
   // 6. invalid users
   if (resolved["invalid users"]!.defined) {
@@ -339,14 +351,22 @@ export interface CreateContext {
   parentSetgid?: boolean;
   parentOwner?: string;
   parentGroup?: string;
-  /** umask des workers ksmbd (init_fs) */
-  umask?: number;
+  /**
+   * umask des workers ksmbd (kworker sur init_fs). 0022 sur les noyaux récents ;
+   * à lire sur le serveur : grep Umask /proc/$(pgrep -x kthreadd)/status
+   */
+  umask: number;
   /** le client envoie un descripteur de sécurité à la création (Explorateur avec ACL explicites) */
   clientSendsSecurityDescriptor?: boolean;
 }
 
 export interface CreateResult {
+  /** bits du mode tels que calculés par le noyau à la création */
   mode: number;
+  /** mode affiché par stat / ls quand une ACL avec masque est posée (bits groupe = masque) */
+  statMode: number;
+  /** droits effectifs par classe, si différents de statMode */
+  effective?: string;
   owner: string;
   group: string;
   acl: string;
@@ -355,6 +375,7 @@ export interface CreateResult {
 }
 
 const oct = (n: number) => n.toString(8).padStart(4, "0");
+const rwx = (bits: number) => `${bits & 4 ? "r" : "-"}${bits & 2 ? "w" : "-"}${bits & 1 ? "x" : "-"}`;
 
 export function computeCreate(doc: IniDocument, shareName: string, account: string, db: UserDb, ctx: CreateContext): CreateResult {
   const eff = effectiveShare(doc, shareName);
@@ -365,7 +386,7 @@ export function computeCreate(doc: IniDocument, shareName: string, account: stri
   const forceKey = isDir ? "force directory mode" : "force create mode";
   const mask = parseInt(eff[maskKey]!.value, 8) || 0;
   const force = parseInt(eff[forceKey]!.value, 8) || 0;
-  const umask = ctx.umask ?? 0o022;
+  const umask = ctx.umask;
 
   const requested = ctx.posixMode ?? 0o7777;
   steps.push({ label: "Mode demandé", effect: "info", detail: ctx.posixMode !== undefined ? `${oct(requested)} (client Linux, extensions POSIX)` : "tous les bits (client Windows / macOS : pas de mode POSIX)" });
@@ -375,38 +396,44 @@ export function computeCreate(doc: IniDocument, shareName: string, account: stri
   mode |= force;
   steps.push({ label: forceKey, param: forceKey, value: eff[forceKey]!.value, effect: "info", detail: `OU → ${oct(mode)}` });
 
+  if (isDir) {
+    const before = mode;
+    mode &= 0o1777; // vfs_mkdir : S_IRWXUGO | S_ISVTX
+    if (before !== mode) {
+      steps.push({ label: "vfs_mkdir", effect: "info", detail: `masque S_IRWXUGO|S_ISVTX : ${oct(before)} → ${oct(mode)} (le setgid demandé est perdu ; seul un parent setgid le transmet)` });
+    }
+  } else if (mode & 0o2000) {
+    steps.push({ label: "setgid sur fichier", effect: "info", detail: "Retiré par le noyau si l'appelant n'est pas membre du groupe du fichier (mode_strip_sgid)" });
+  }
+
   const ident = effectiveIdentity(doc, shareName, account, db);
   let owner = ident.uid;
   let group = ident.gid;
 
-  // sgid : retiré d'un fichier si le groupe n'est pas celui de l'appelant (mode_strip_sgid)
-  if (!isDir && mode & 0o2000) {
-    steps.push({ label: "setgid sur fichier", effect: "info", detail: "Retiré par le noyau si l'appelant n'est pas membre du groupe du fichier" });
-  }
-
   let acl = "aucune";
+  let initAcl = false;
   if (ctx.posixAclFs && ctx.parentHasDefaultAcl) {
-    acl = "copie de l'ACL par défaut du parent";
-    steps.push({ label: "ACL par défaut du parent", effect: "info", detail: `Le noyau applique l'ACL par défaut : l'umask est ignoré, chaque classe est bornée par ${oct(mode)}${isDir ? " et le dossier hérite aussi de l'ACL par défaut" : ""}` });
+    acl = "copie de l'ACL par défaut du parent (bornée par le mode calculé)";
+    steps.push({ label: "ACL par défaut du parent", effect: "info", detail: `Le noyau copie l'ACL par défaut : l'umask est ignoré, chaque classe est bornée par ${oct(mode)}${isDir ? " ; le dossier hérite aussi de l'ACL par défaut" : ""}. Le mode final dépend du contenu de cette ACL.` });
   } else {
     const before = mode;
     mode &= ~umask;
-    steps.push({ label: "umask du noyau", effect: "info", detail: `umask ${oct(umask)} des workers ksmbd appliqué (${ctx.posixAclFs ? "pas d'ACL par défaut sur le parent" : "acltype=off"}) : ${oct(before)} → ${oct(mode)}` });
+    steps.push({ label: "umask des workers ksmbd", effect: "info", detail: `umask ${oct(umask)} appliqué (${ctx.posixAclFs ? "pas d'ACL par défaut sur le parent" : "acltype=off"}) : ${oct(before)} → ${oct(mode)}` });
     if (before & ~mode & 0o020) {
-      warnings.push(`L'umask ${oct(umask)} retire l'écriture groupe : create mask / force create mode ne suffisent pas. ` +
+      warnings.push(`L'umask ${oct(umask)} des workers ksmbd retire l'écriture groupe : create mask / force create mode ne suffisent pas. ` +
         (ctx.posixAclFs ? "Posez une ACL par défaut sur la racine du partage (setfacl -d -m g::rwx …)." : "En acltype=off c'est inévitable avec ksmbd : passez le dataset en posixacl avec une ACL par défaut."));
     }
   }
 
   if (ctx.parentSetgid) {
     group = ctx.parentGroup ?? group;
-    steps.push({ label: "setgid du parent", effect: "info", detail: `Groupe hérité du dossier parent (${group})${isDir ? ", et le nouveau dossier reçoit aussi le bit setgid" : ""}` });
+    steps.push({ label: "setgid du parent", effect: "info", detail: `Groupe hérité du dossier parent (${group})${isDir ? ", et le nouveau dossier reçoit le bit setgid" : ""}` });
     if (isDir) mode |= 0o2000;
   }
 
   if (ksmbdBool(eff["inherit owner"]?.value)) {
     owner = ctx.parentOwner ?? "(propriétaire du parent)";
-    steps.push({ label: "inherit owner", param: "inherit owner", value: "yes", effect: "info", detail: `UID repris du parent (${owner}) ; le groupe n'est pas changé` });
+    steps.push({ label: "inherit owner", param: "inherit owner", value: "yes", effect: "info", detail: `UID repris du parent (${owner}) ; le groupe n'est pas changé. Fait par i_uid_write() sans notify_change : persistance non garantie sur tous les systèmes de fichiers.` });
   }
 
   const vfs = ksmbdList(eff["vfs objects"]?.value);
@@ -419,15 +446,19 @@ export function computeCreate(doc: IniDocument, shareName: string, account: stri
     acl = "ACL NT héritée du parent";
   } else {
     if (ctx.posixAclFs && !ctx.parentHasDefaultAcl) {
-      steps.push({ label: "ACL initiale", effect: "info", detail: `ksmbd pose une ACL POSIX dérivée du mode (u/g/o)${isDir ? " + la même en ACL par défaut sur le dossier" : ""}` });
-      acl = isDir ? "ACL de base + ACL par défaut équivalente" : "ACL de base dérivée du mode";
+      initAcl = true;
+      const u = (mode >> 6) & 7, g = (mode >> 3) & 7, o = mode & 7;
+      acl = `user::${rwx(u)}, user:${owner}:${rwx(u)}, group::${rwx(g)}, group:${group}:${rwx(g)}, mask::rwx, other::${rwx(o)}` + (isDir ? " (+ la même en ACL par défaut)" : "");
+      steps.push({ label: "ACL initiale (ksmbd_vfs_set_init_posix_acl)", effect: "info", detail: `ksmbd pose ${acl}. Le masque rwx est recopié dans les bits groupe du mode : stat affiche g=rwx et « + », mais les droits effectifs du groupe propriétaire restent ${rwx(g)} ; un chmod g+… ne modifiera que le masque.` });
     }
     if (aclXattr) {
       steps.push({ label: "security.NTACL", effect: "info", detail: "ksmbd écrit une ACL NT construite à partir des droits POSIX" });
     }
   }
 
-  return { mode, owner, group, acl, steps, warnings };
+  const statMode = initAcl ? (mode & ~0o070) | 0o070 : mode;
+  const effective = initAcl ? `u=${rwx((mode >> 6) & 7)} g=${rwx((mode >> 3) & 7)} o=${rwx(mode & 7)}` : undefined;
+  return { mode, statMode, effective, owner, group, acl, steps, warnings };
 }
 
 // ------------------------------------------------------------------ accès à un fichier existant

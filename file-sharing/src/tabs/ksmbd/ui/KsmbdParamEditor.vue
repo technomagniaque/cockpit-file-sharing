@@ -4,7 +4,7 @@
  * catégorie. Une valeur vide retire la clé (valeur par défaut de ksmbd-tools).
  */
 import { computed, ref } from "vue";
-import { categoryLabels, paramsFor, findParam, ksmbdBool, ksmbdOpt, type KsmbdParam, type KsmbdCategory } from "../ksmbd-params";
+import { categoryLabels, paramsFor, findParamExact, defaultFor, ksmbdBool, ksmbdOpt, type KsmbdParam, type KsmbdCategory } from "../ksmbd-params";
 import { getValue, setValue, deleteValue, type IniSection } from "../ini";
 
 const props = defineProps<{
@@ -17,12 +17,12 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: "changed"): void }>();
 
 const filter = ref("");
-const showUndocumented = ref(true);
+const showUndocumented = ref(false);
 
 const groups = computed(() => {
   const params = paramsFor(props.scope).filter(
     (p) =>
-      (showUndocumented.value || p.documented !== false) &&
+      (showUndocumented.value || p.documented !== false || !!getValue(props.section, p.key)) &&
       (!filter.value || (p.key + p.description).toLowerCase().includes(filter.value.toLowerCase()))
   );
   const out: { cat: KsmbdCategory; label: string; params: KsmbdParam[] }[] = [];
@@ -34,13 +34,14 @@ const groups = computed(() => {
   return out;
 });
 
-const unknownKeys = computed(() => props.section.entries.filter((e) => !findParam(e.key)));
+// comparaison exacte façon ksmbd-tools : « readonly » n'est pas « read only »
+const unknownKeys = computed(() => props.section.entries.filter((e) => !findParamExact(e.key)));
 
 function val(p: KsmbdParam): string {
   return getValue(props.section, p.key) ?? "";
 }
 function inheritedVal(p: KsmbdParam): string | undefined {
-  if (props.scope !== "share" || p.scope !== "share") return undefined;
+  if (props.scope !== "share" || p.key === "guest account" || p.key === "max connections" || p.ignored) return undefined;
   return getValue(props.inherited, p.key);
 }
 function set(p: KsmbdParam, v: string) {
@@ -50,20 +51,23 @@ function set(p: KsmbdParam, v: string) {
 }
 function placeholder(p: KsmbdParam) {
   const inh = inheritedVal(p);
-  return inh !== undefined ? `${inh} (hérité de [global])` : p.default ? `${p.default} (défaut)` : "(non défini)";
+  const d = defaultFor(p, props.scope);
+  return inh !== undefined ? `${inh} (hérité de [global])` : d ? `${d} (défaut)` : "(non défini)";
 }
 /** Avertit quand ksmbd-tools lirait la valeur autrement que prévu. */
 function valueWarning(p: KsmbdParam): string | undefined {
   const v = val(p).trim();
   if (!v) return undefined;
+  if (p.ignored) return `Sans effet : ${p.ignored}.`;
+  if (/[;#]/.test(v)) return "ksmbd-tools coupe la valeur au premier « ; » ou « # »";
   if (p.type === "bool" && !/^(yes|no|true|false|1|0|enable|disable)$/i.test(v))
     return `ksmbd lira « ${v} » comme ${ksmbdBool(v) ? "vrai" : "faux"}`;
   if (p.type === "opt" && ksmbdOpt(v) !== v.toLowerCase()) return `ksmbd lira « ${v} » comme ${ksmbdOpt(v)}`;
   if (p.type === "octal" && !/^0?[0-7]{3,4}$/.test(v)) return "mode octal attendu (ex. 0775)";
   if (p.type === "size" && !/^\d+\s*[kmgtpe]?b?$/i.test(v)) return "taille attendue (ex. 8MB)";
-  if (p.key === "hosts allow" || p.key === "hosts deny") {
-    const bad = v.split(/[\s,]+/).filter((h) => h && !/^\d{1,3}(\.\d{1,3}){3}$/.test(h) && !h.includes(":"));
-    if (bad.length) return `comparaison exacte d'IP seulement : ${bad.join(", ")} ne correspondra jamais`;
+  if (p.key === "interfaces") {
+    const bad = v.split(/[\s,]+/).filter((h) => /^\d{1,3}(\.\d{1,3}){3}/.test(h) || h.includes(":") || h.includes("/"));
+    if (bad.length) return `noms d'interface attendus, pas d'adresses : ${bad.join(", ")}`;
   }
   return undefined;
 }
@@ -81,7 +85,7 @@ function toggleListValue(p: KsmbdParam, item: string) {
       <input v-model="filter" class="input-textlike w-64" placeholder="Filtrer les paramètres…" />
       <label class="text-sm text-muted flex items-center gap-1">
         <input type="checkbox" v-model="showUndocumented" />
-        afficher les clés non documentées (admin users, hosts allow/deny)
+        afficher les clés ignorées par ksmbd-tools (admin users, hosts allow/deny)
       </label>
     </div>
 
@@ -91,7 +95,8 @@ function toggleListValue(p: KsmbdParam, item: string) {
         <div v-for="p in g.params" :key="p.key">
           <label class="block text-sm">
             <span class="font-mono">{{ p.key }}</span>
-            <span v-if="p.documented === false" class="ml-1 text-xs text-warning">non documenté</span>
+            <span v-if="p.ignored" class="ml-1 text-xs text-danger">ignoré par ksmbd-tools</span>
+            <span v-else-if="p.documented === false" class="ml-1 text-xs text-warning">non documenté</span>
           </label>
           <select v-if="p.type === 'bool'" class="input-textlike w-full" :value="val(p)" @change="set(p, ($event.target as HTMLSelectElement).value)">
             <option value="">{{ placeholder(p) }}</option>

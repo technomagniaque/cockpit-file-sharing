@@ -127,8 +127,8 @@ function downloadPreview() {
       <label class="flex items-center gap-2"><input type="checkbox" v-model="opts.leases" /> smb2 leases</label>
       <label class="flex items-center gap-2"><input type="checkbox" v-model="opts.timeMachine" /> convertir fruit:time machine</label>
       <label class="flex items-center gap-2"><input type="checkbox" v-model="opts.keepWindowsAcls" /> garder les ACL Windows (acl_xattr)</label>
-      <label class="flex items-center gap-2" title="Sinon, toute liste d'hôtes contenant une plage est retirée entièrement">
-        <input type="checkbox" v-model="opts.hostsExactOnly" /> hosts allow/deny : garder les IP exactes
+      <label class="flex items-center gap-2" title="ksmbd accepte les membres de read list / write list sans consulter valid users">
+        <input type="checkbox" v-model="opts.intersectWithValidUsers" /> limiter read list / write list à valid users
       </label>
       <span></span>
       <label>Signature
@@ -160,6 +160,12 @@ function downloadPreview() {
     <div v-if="error" class="text-danger">{{ error }}</div>
 
     <template v-if="result">
+      <div v-if="result.blocking.length" class="rounded-lg border border-default p-3 text-danger">
+        <div class="font-semibold">À lire avant d'appliquer</div>
+        <ul class="list-disc pl-5">
+          <li v-for="b in result.blocking" :key="b">{{ b }}</li>
+        </ul>
+      </div>
       <div class="flex flex-row flex-wrap gap-2 items-center">
         <span class="text-label">Rapport</span>
         <button v-for="f in (['problems', 'all', 'dropped', 'warning', 'converted', 'added', 'skipped-section', 'kept'] as const)" :key="f"
@@ -197,7 +203,8 @@ function downloadPreview() {
       </div>
       <p class="text-xs text-muted">
         « Charger dans l'éditeur » remplace la configuration affichée sans l'écrire ; vérifiez puis utilisez « Enregistrer »
-        (une copie <span class="font-mono">ksmbd.conf.bak-…</span> est créée). Samba et ksmbd ne peuvent pas écouter tous deux sur le port 445.
+        (une copie <span class="font-mono">ksmbd.conf.bak-…</span> est créée). Les paramètres [global] ne s'appliquent qu'après
+        « systemctl restart ksmbd ». Samba et ksmbd ne peuvent pas écouter tous deux sur le port 445.
       </p>
     </template>
   </div>

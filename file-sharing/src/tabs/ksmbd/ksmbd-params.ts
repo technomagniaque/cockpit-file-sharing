@@ -59,7 +59,15 @@ export interface KsmbdParam {
   /** synonymes acceptés par ksmbd-tools */
   aliases?: string[];
   warning?: string;
+  /** défaut différent quand le paramètre est placé dans un partage */
+  shareDefault?: string;
+  /** clé reconnue mais jamais lue par ksmbd-tools (motif) */
+  ignored?: string;
 }
+
+/** Clés désactivées dans ksmbd-tools : KSMBD_SHARE_CONF_IS_BROKEN (include/management/share.h). */
+export const BROKEN_KEYS = ["admin users", "hosts allow", "hosts deny"];
+const BROKEN_REASON = "ignoré par ksmbd-tools (KSMBD_SHARE_CONF_IS_BROKEN) : la clé n'est jamais lue, ni dans un partage ni dans [global]";
 
 export const OPT_VALUES = ["enabled", "auto", "mandatory", "disabled"];
 
@@ -81,11 +89,11 @@ export const ksmbdParams: KsmbdParam[] = [
   { key: "server min protocol", scope: "global", type: "enum", default: "SMB2_10", values: ["SMB2_10", "SMB3_00", "SMB3_02", "SMB3_11"], category: "security", description: "Dialecte minimal. SMB1 n'existe pas dans ksmbd." },
   { key: "server max protocol", scope: "global", type: "enum", default: "SMB3_11", values: ["SMB2_10", "SMB3_00", "SMB3_02", "SMB3_11"], category: "security", description: "Dialecte maximal." },
   { key: "server signing", scope: "global", type: "opt", default: "auto", values: OPT_VALUES, category: "security", description: "Signature SMB. « mandatory » l'exige.", warning: "Toute valeur autre que enabled / auto / mandatory équivaut à disabled." },
-  { key: "smb3 encryption", scope: "both", type: "opt", default: "auto", values: OPT_VALUES, category: "security", description: "Chiffrement SMB3. En global, « mandatory » l'impose partout ; dans un partage, « disabled » le désactive pour ce partage.", warning: "« yes » ou « required » sont lus comme disabled." },
+  { key: "smb3 encryption", scope: "both", type: "opt", default: "auto", values: OPT_VALUES, category: "security", description: "Chiffrement SMB3. En global, « mandatory » l'impose partout et « disabled » le refuse. Dans un partage, « mandatory » l'exige pour ce partage et « disabled » signifie seulement « non exigé » (les clients peuvent quand même chiffrer).", warning: "« yes » ou « required » sont lus comme disabled." },
   { key: "kerberos support", scope: "global", type: "bool", default: "no", category: "security", description: "Authentification Kerberos (pas de jonction AD complète : pas de winbind ni d'idmap)." },
   { key: "kerberos service name", scope: "global", type: "string", default: "", category: "security", description: "Principal de service Kerberos." },
   { key: "kerberos keytab file", scope: "global", type: "string", default: "", category: "security", description: "Keytab Kerberos." },
-  { key: "restrict anonymous", scope: "global", type: "enum", default: "0", values: ["0", "1", "2"], category: "security", description: "1 ou 2 : refuse les sessions invité sur les partages sans « guest ok » et sur IPC$." },
+  { key: "restrict anonymous", scope: "global", type: "enum", default: "0", values: ["0", "1", "2"], category: "security", description: "1 ou 2 : refuse les sessions invité sur les partages sans « guest ok » et sur IPC$. Toute autre valeur vaut 0." },
 
   // ---------------------------------------------------------------- performances
   { key: "smb2 max read", scope: "global", type: "size", default: "4MB", category: "performance", description: "Taille max. d'une lecture SMB2 (TCP)." },
@@ -109,7 +117,7 @@ export const ksmbdParams: KsmbdParam[] = [
   // ---------------------------------------------------------------- limites
   { key: "max active sessions", scope: "global", type: "int", default: "1024", category: "limits", description: "Sessions simultanées max." },
   { key: "max sessions per connection", scope: "global", type: "int", default: "64", category: "limits", description: "Sessions max. par connexion TCP." },
-  { key: "max connections", scope: "both", type: "int", default: "256", category: "limits", description: "Connexions max. (global : 256, par partage : 128)." },
+  { key: "max connections", scope: "both", type: "int", default: "256", shareDefault: "128", category: "limits", description: "En [global] : plafond de connexions pour TOUT le serveur (défaut 256), non propagé aux partages. Dans un partage : plafond de ce partage (défaut 128)." },
   { key: "max ip connections", scope: "global", type: "int", default: "32", category: "limits", description: "Connexions max. par adresse IP. Le multicanal en ouvre plusieurs par client." },
   { key: "max open files", scope: "global", type: "int", default: "10000", category: "limits", description: "Fichiers ouverts max." },
 
@@ -119,21 +127,23 @@ export const ksmbdParams: KsmbdParam[] = [
 
   // ---------------------------------------------------------------- accès
   { key: "valid users", scope: "share", type: "list", default: "", category: "access", description: "Utilisateurs autorisés (@groupe accepté). Vide = tous." },
-  { key: "invalid users", scope: "share", type: "list", default: "", category: "access", description: "Utilisateurs refusés. Prioritaire sur valid users, read list et write list, mais PAS sur admin users." },
-  { key: "read list", scope: "share", type: "list", default: "", category: "access", description: "Accès lecture seule. Prioritaire sur write list et read only = no." },
-  { key: "write list", scope: "share", type: "list", default: "", category: "access", description: "Accès lecture-écriture. Prioritaire sur read only = yes." },
-  { key: "admin users", scope: "share", type: "list", default: "", category: "access", documented: false, description: "Court-circuite toutes les listes (même invalid users). Contrairement à Samba, ne donne PAS les droits root sur les fichiers." },
-  { key: "hosts allow", scope: "share", type: "list", default: "", category: "access", documented: false, description: "Adresses IP autorisées, comparées à l'identique (pas de CIDR, pas de préfixe « 192.168.1. », pas de nom d'hôte). Si la liste existe, elle prime sur hosts deny." },
-  { key: "hosts deny", scope: "share", type: "list", default: "", category: "access", documented: false, description: "Adresses IP refusées (comparaison exacte). Ignoré si hosts allow est défini." },
+  { key: "invalid users", scope: "share", type: "list", default: "", category: "access", description: "Utilisateurs refusés. Prioritaire sur read list, write list et valid users." },
+  { key: "read list", scope: "share", type: "list", default: "", category: "access", description: "Accès lecture seule. Prioritaire sur write list et read only = no. ATTENTION : un membre est accepté sans que valid users soit consulté." },
+  { key: "write list", scope: "share", type: "list", default: "", category: "access", description: "Accès lecture-écriture. Prioritaire sur read only = yes. ATTENTION : un membre est accepté sans que valid users soit consulté." },
+  { key: "admin users", scope: "share", type: "list", default: "", category: "access", documented: false, ignored: BROKEN_REASON, description: "Sans effet : ksmbd-tools ne lit pas cette clé." },
+  { key: "hosts allow", scope: "share", type: "list", default: "", category: "access", documented: false, ignored: BROKEN_REASON, description: "Sans effet : ksmbd-tools ne lit pas cette clé. Filtrez au pare-feu ou avec bind interfaces only." },
+  { key: "hosts deny", scope: "share", type: "list", default: "", category: "access", documented: false, ignored: BROKEN_REASON, description: "Sans effet : ksmbd-tools ne lit pas cette clé. Filtrez au pare-feu." },
   { key: "read only", scope: "share", type: "bool", default: "yes", category: "access", description: "Partage en lecture seule. Prioritaire sur writable / writeable / write ok." },
-  { key: "writable", scope: "share", type: "bool", default: "no", category: "access", description: "Inverse de read only (ignoré si read only est présent).", aliases: ["writeable", "write ok"] },
+  { key: "writable", scope: "share", type: "bool", default: "", category: "access", description: "Inverse de read only. Ignoré si read only est défini (même hérité de [global]) ; lu avant writeable et write ok." },
+  { key: "writeable", scope: "share", type: "bool", default: "", category: "access", description: "Synonyme de writable, lu seulement si ni read only ni writable ne sont définis." },
+  { key: "write ok", scope: "share", type: "bool", default: "", category: "access", description: "Synonyme de writable, lu en dernier." },
 
   // ---------------------------------------------------------------- unix
   { key: "create mask", scope: "share", type: "octal", default: "0744", category: "unix", description: "ET binaire appliqué au mode demandé pour un nouveau fichier." },
-  { key: "directory mask", scope: "share", type: "octal", default: "0755", category: "unix", description: "ET binaire appliqué au mode demandé pour un nouveau dossier." },
+  { key: "directory mask", scope: "share", type: "octal", default: "0755", category: "unix", description: "ET binaire appliqué au mode demandé pour un nouveau dossier. Le bit setgid (2000) est retiré par vfs_mkdir : il ne vient que d'un parent setgid." },
   { key: "force create mode", scope: "share", type: "octal", default: "0000", category: "unix", description: "OU binaire appliqué après create mask." },
-  { key: "force directory mode", scope: "share", type: "octal", default: "0000", category: "unix", description: "OU binaire appliqué après directory mask." },
-  { key: "force user", scope: "share", type: "string", default: "", category: "unix", description: "UID effectif de toutes les opérations. Les groupes secondaires de l'utilisateur connecté restent actifs (différent de Samba)." },
+  { key: "force directory mode", scope: "share", type: "octal", default: "0000", category: "unix", description: "OU binaire appliqué après directory mask (setgid retiré par le noyau, voir directory mask)." },
+  { key: "force user", scope: "share", type: "string", default: "", category: "unix", description: "UID effectif de toutes les opérations. Doit exister comme compte Unix (pas besoin de ksmbd.adduser). Les groupes secondaires de l'utilisateur connecté restent actifs (différent de Samba)." },
   { key: "force group", scope: "share", type: "string", default: "", category: "unix", description: "GID effectif. Avec force user seul, le groupe primaire de ce compte est utilisé." },
   { key: "inherit owner", scope: "share", type: "bool", default: "no", category: "unix", description: "Le nouvel objet reçoit l'UID du dossier parent (seulement l'UID : le groupe suit setgid / force group)." },
   { key: "vfs objects", scope: "share", type: "list", default: "", values: ["acl_xattr", "streams_xattr"], category: "unix", description: "acl_xattr : ACL NT dans security.NTACL, vérifiée EN PLUS des droits POSIX. streams_xattr : flux nommés (ADS, métadonnées macOS) en xattrs." },
@@ -164,8 +174,20 @@ for (const p of ksmbdParams) {
   for (const a of p.aliases ?? []) byNormalized.set(normalizeKey(a), p);
 }
 
+/** Recherche tolérante façon Samba (casse, espaces, « _ » ignorés) : pour lire un smb.conf. */
 export function findParam(key: string): KsmbdParam | undefined {
   return byNormalized.get(normalizeKey(key));
+}
+
+const byExact = new Map<string, KsmbdParam>(ksmbdParams.map((p) => [p.key.toLowerCase(), p]));
+
+/** Recherche exacte façon ksmbd-tools (casse ignorée seulement). */
+export function findParamExact(key: string): KsmbdParam | undefined {
+  return byExact.get(key.trim().toLowerCase());
+}
+
+export function defaultFor(p: KsmbdParam, scope: "global" | "share"): string {
+  return scope === "share" && p.shareDefault !== undefined ? p.shareDefault : p.default;
 }
 
 export function paramsFor(scope: "global" | "share"): KsmbdParam[] {

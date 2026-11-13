@@ -5,6 +5,7 @@
  */
 import { BashCommand, File, server as defaultServer, unwrap, type Server } from "@45drives/houston-common-lib";
 import type { UserDb } from "./permission-stack";
+import { findSection, parseIni, serializeIni } from "./ini";
 
 export const KSMBD_CONF = "/etc/ksmbd/ksmbd.conf";
 export const KSMBD_PWDDB = "/etc/ksmbd/ksmbdpwd.db";
@@ -32,6 +33,8 @@ export interface KsmbdProbe {
   netdevs: { name: string; state: string; driver: string; speed: string }[];
   zfsVersion: string;
   timeMachineCapable: boolean;
+  /** umask des workers ksmbd (celui de kthreadd), ex. 0o022 ; null si illisible */
+  workerUmask: number | null;
 }
 
 export interface PathProbe {
@@ -63,15 +66,31 @@ export class KsmbdManager {
     return r.out;
   }
 
-  /** Écrit ksmbd.conf avec copie de sauvegarde, valide puis recharge ksmbd.mountd. */
-  async writeConf(text: string): Promise<{ backup: string; reload: RunResult }> {
+  /**
+   * Écrit ksmbd.conf avec copie de sauvegarde puis recharge ksmbd.mountd.
+   * ksmbd.control --reload ne relit que les partages : si [global] a changé,
+   * needsRestart est vrai et rien n'est appliqué tant que ksmbd n'est pas
+   * redémarré (systemctl restart ksmbd = ksmbd.control --shutdown puis ksmbd.mountd).
+   */
+  async writeConf(text: string): Promise<{ backup: string; reload: RunResult; needsRestart: boolean }> {
+    const previous = await this.readConf();
+    const globalOf = (t: string) => {
+      const g = findSection(parseIni(t, "ksmbd"), "global");
+      return g ? serializeIni({ sections: [{ ...g, entries: [...g.entries].sort((a, b) => a.key.localeCompare(b.key)) }] }) : "";
+    };
+    const needsRestart = globalOf(previous) !== globalOf(text);
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const backup = `${this.confPath}.bak-${stamp}`;
     await this.run('mkdir -p -- "$(dirname -- "$1")" && { [ ! -f "$1" ] || cp -a -- "$1" "$2"; }', [this.confPath, backup]);
     const file = new File(this.server, this.confPath);
     await unwrap(file.exists({ superuser: "try" }).andThen((exists) => (exists ? file.replace(text, { superuser: "try" }) : file.create(true, { superuser: "try" }).andThen((f) => f.replace(text, { superuser: "try" })))));
     const reload = await this.run('if pgrep -x ksmbd.mountd >/dev/null; then ksmbd.control --reload; else echo "ksmbd.mountd arrêté : rien à recharger"; fi');
-    return { backup, reload };
+    return { backup, reload, needsRestart };
+  }
+
+  /** Redémarrage complet (nécessaire après un changement de [global]). */
+  async restart(): Promise<RunResult> {
+    return this.run("systemctl restart ksmbd.service");
   }
 
   async readSamba(smbConfPath: string): Promise<{ smbConf: string; registry: string; testparm: string }> {
@@ -115,6 +134,8 @@ pgrep -x ksmbd.mountd >/dev/null && echo "mountd=1" || echo "mountd=0"
 [ -f "$1" ] && echo "conf=1" || echo "conf=0"
 (systemctl is-active -q smb || systemctl is-active -q smbd) 2>/dev/null && echo "samba=1" || echo "samba=0"
 echo "zfs=$(zfs version 2>/dev/null | head -1)"
+kt=$(pgrep -x kthreadd 2>/dev/null | head -1); [ -n "$kt" ] || kt=2
+echo "umask=$(awk '/^Umask:/{print $2}' /proc/$kt/status 2>/dev/null)"
 command -v rdma >/dev/null && rdma -j link show 2>/dev/null | sed 's/^/rdma=/'
 for n in /sys/class/net/*; do b=$(basename "$n"); [ "$b" = lo ] && continue
   drv=$(basename "$(readlink -f "$n/device/driver" 2>/dev/null)" 2>/dev/null)
@@ -160,6 +181,7 @@ done
       rdmaLinks,
       netdevs: nets,
       timeMachineCapable: major > 7 || (major === 7 && minor >= 3),
+      workerUmask: /^[0-7]{3,4}$/.test(kv.umask ?? "") ? parseInt(kv.umask!, 8) : null,
     };
   }
 
@@ -168,12 +190,12 @@ done
 p="$1"
 [ -e "$p" ] || { echo "exists=0"; exit 0; }
 echo "exists=1"
-stat -c 'owner=%U%ngroup=%G%nmode=%a' -- "$p"
+stat --printf 'owner=%U\ngroup=%G\nmode=%a\n' -- "$p"
 echo "fstype=$(findmnt -no FSTYPE -T "$p" 2>/dev/null)"
 src=$(findmnt -no SOURCE -T "$p" 2>/dev/null)
 [ "$(findmnt -no FSTYPE -T "$p")" = zfs ] && echo "acltype=$(zfs get -H -o value acltype "$src" 2>/dev/null)"
 findmnt -no OPTIONS -T "$p" 2>/dev/null | tr ',' '\n' | grep -qx posixacl && echo "mntposixacl=1"
-getfacl -p --absolute-names -d -- "$p" 2>/dev/null | grep -q '^default:' && echo "defacl=1" || echo "defacl=0"
+getfacl -p --absolute-names -- "$p" 2>/dev/null | grep -q '^default:' && echo "defacl=1" || echo "defacl=0"
 getfattr -n security.NTACL --absolute-names -- "$p" >/dev/null 2>&1 && echo "ntacl=1" || echo "ntacl=0"
 `, [path]);
     const kv: Record<string, string> = {};

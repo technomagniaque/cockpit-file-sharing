@@ -13,7 +13,7 @@ import type { UserDb } from "../permission-stack";
 const userSettings = useUserSettings();
 const manager = new KsmbdManager();
 
-const doc = ref<IniDocument>({ sections: [{ name: "global", entries: [] }] });
+const doc = ref<IniDocument>({ flavor: "ksmbd", sections: [{ name: "global", entries: [], flavor: "ksmbd" }] });
 const savedText = ref("");
 const rawText = ref("");
 const rawMode = ref(false);
@@ -23,6 +23,8 @@ const selectedShare = ref("");
 const newShareName = ref("");
 const busy = ref(false);
 const view = ref<"config" | "simulator" | "convert">("config");
+const needsRestart = ref(false);
+const parseIssues = ref<{ errors: NonNullable<IniDocument["errors"]>; truncated: NonNullable<IniDocument["truncated"]> }>({ errors: [], truncated: [] });
 
 const header = ["ksmbd.conf géré par cockpit-file-sharing — voir ksmbd.conf(5)"];
 const currentText = computed(() => serializeIni(doc.value, header));
@@ -33,9 +35,10 @@ const share = computed(() => (selectedShare.value ? findSection(doc.value, selec
 const netdevs = computed(() => (probe.value?.netdevs ?? []).map((n) => n.name));
 
 function loadText(text: string, markSaved = false) {
-  // ksmbd-tools retient la première occurrence d'une clé
-  const parsed = parseIni(text, "first");
-  if (!findSection(parsed, "global")) parsed.sections.unshift({ name: "global", entries: [] });
+  // lecture façon ksmbd-tools : première occurrence, troncature au « ; » / « # », pas de continuation
+  const parsed = parseIni(text, "ksmbd");
+  parseIssues.value = { errors: parsed.errors ?? [], truncated: parsed.truncated ?? [] };
+  if (!findSection(parsed, "global")) parsed.sections.unshift({ name: "global", entries: [], flavor: "ksmbd" });
   doc.value = parsed;
   rawText.value = serializeIni(parsed, header);
   if (markSaved) savedText.value = rawText.value;
@@ -70,10 +73,29 @@ async function save() {
     const r = await manager.writeConf(text);
     savedText.value = text;
     loadText(text, true);
+    if (r.needsRestart) needsRestart.value = true;
     pushNotification(new Notification("ksmbd.conf enregistré",
-      `Copie : ${r.backup}\n${r.reload.out || r.reload.err}`.trim(), r.reload.code === 0 ? "success" : "warning", 8000));
+      `Copie : ${r.backup}\n` + (r.needsRestart
+        ? "[global] a changé : ksmbd.control --reload ne relit que les partages. Redémarrage complet nécessaire (systemctl restart ksmbd)."
+        : (r.reload.out || r.reload.err)).trim(),
+      r.needsRestart || r.reload.code !== 0 ? "warning" : "success", 10000));
   } catch (e: any) {
     pushNotification(new Notification("Écriture impossible", e?.message ?? String(e), "error"));
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function restartKsmbd() {
+  busy.value = true;
+  try {
+    const r = await manager.restart();
+    if (r.code === 0) {
+      needsRestart.value = false;
+      pushNotification(new Notification("ksmbd redémarré", "Les paramètres [global] sont appliqués.", "success", 6000));
+    } else {
+      pushNotification(new Notification("Redémarrage impossible", r.err || r.out, "error"));
+    }
   } finally {
     busy.value = false;
   }
@@ -82,7 +104,7 @@ async function save() {
 function addShare() {
   const name = newShareName.value.trim();
   if (!name || findSection(doc.value, name)) return;
-  doc.value.sections.push({ name, entries: [{ key: "path", value: "" }, { key: "read only", value: "no" }] });
+  doc.value.sections.push({ name, flavor: "ksmbd", entries: [{ key: "path", value: "" }, { key: "read only", value: "no" }] });
   selectedShare.value = name;
   newShareName.value = "";
 }
@@ -123,6 +145,7 @@ const envIssues = computed(() => {
         <div class="col-span-2"><span class="text-muted">OpenZFS</span> <span class="font-mono">{{ probe.zfsVersion || "—" }}</span></div>
         <div><span class="text-muted">ksmbd.mountd</span> {{ probe.mountdRunning ? "actif" : "arrêté" }}</div>
         <div><span class="text-muted">Samba</span> {{ probe.sambaRunning ? "actif" : "arrêté" }}</div>
+        <div><span class="text-muted">umask des workers</span> <span class="font-mono">{{ probe.workerUmask != null ? probe.workerUmask.toString(8).padStart(4, "0") : "?" }}</span></div>
       </div>
       <ul v-if="envIssues.length" class="mt-2 list-disc pl-5 text-sm text-warning">
         <li v-for="i in envIssues" :key="i">{{ i }}</li>
@@ -139,6 +162,19 @@ const envIssues = computed(() => {
         <template #header>
           Configuration {{ manager.confPath }}<span v-if="modified"> *</span>
         </template>
+        <div v-if="needsRestart" class="mb-3 rounded-lg border border-default p-3 text-sm text-warning">
+          [global] a été modifié : ksmbd ne l'applique qu'au démarrage (ksmbd.control --reload ne relit que les partages).
+          Le redémarrage coupe les connexions SMB en cours (ksmbd.control --shutdown puis ksmbd.mountd).
+          <button class="btn btn-secondary ml-2" :disabled="busy" @click="restartKsmbd">systemctl restart ksmbd</button>
+        </div>
+        <div v-if="parseIssues.errors.length || parseIssues.truncated.length" class="mb-3 rounded-lg border border-default p-3 text-sm">
+          <div v-for="e in parseIssues.errors" :key="'e' + e.line" class="text-danger">
+            Ligne {{ e.line }} : <span class="font-mono">{{ e.text }}</span> — {{ e.reason }}
+          </div>
+          <div v-for="t in parseIssues.truncated" :key="t.section + t.key" class="text-warning">
+            [{{ t.section }}] <span class="font-mono">{{ t.key }} = {{ t.raw }}</span> est lu « {{ t.value }} » par ksmbd-tools (coupé au « ; » ou « # »)
+          </div>
+        </div>
         <div class="button-group-row mb-3">
           <button class="btn btn-primary" :disabled="busy || !modified" @click="save">Enregistrer et recharger</button>
           <button class="btn btn-secondary" :disabled="busy || !modified" @click="loadText(savedText, true)">Annuler</button>
@@ -177,7 +213,7 @@ const envIssues = computed(() => {
 
     <CardContainer v-else-if="view === 'simulator'">
       <template #header>Empilement des permissions (configuration affichée, enregistrée ou non)</template>
-      <KsmbdPermissionSimulator :doc="doc" :db="db" :manager="manager" />
+      <KsmbdPermissionSimulator :doc="doc" :db="db" :manager="manager" :workerUmask="probe?.workerUmask" />
     </CardContainer>
 
     <CardContainer v-else>

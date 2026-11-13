@@ -12,7 +12,7 @@
  *  - les options propres à ksmbd (RDMA, multicanal, interfaces, tailles d'E/S…)
  *    sont ajoutées à partir des options de conversion.
  */
-import { cloneDoc, findSection, getValue, parseIni, serializeIni, setValue, type IniDocument, type IniSection } from "./ini";
+import { cloneDoc, deleteValue, findSection, getValue, parseIni, serializeIni, setValue, type IniDocument, type IniSection } from "./ini";
 import { findParam, normalizeKey } from "./ksmbd-params";
 
 export type ReportAction = "kept" | "renamed" | "converted" | "dropped" | "added" | "warning" | "skipped-section";
@@ -53,8 +53,8 @@ export interface ConversionOptions {
   keepWindowsAcls: boolean;
   /** convertit fruit:time machine en « time machine = yes » */
   timeMachine: boolean;
-  /** convertit les entrées « hosts allow » en ne gardant que les IP exactes */
-  hostsExactOnly: boolean;
+  /** retire de read list / write list les entrées absentes de valid users (ksmbd ne consulte pas valid users pour elles) */
+  intersectWithValidUsers: boolean;
   /** partages à exclure de la conversion */
   excludeShares: string[];
 }
@@ -76,7 +76,7 @@ export const defaultConversionOptions = (): ConversionOptions => ({
   minProtocol: "keep",
   keepWindowsAcls: true,
   timeMachine: true,
-  hostsExactOnly: true,
+  intersectWithValidUsers: true,
   excludeShares: [],
 });
 
@@ -86,6 +86,8 @@ export interface ConversionResult {
   report: ReportLine[];
   /** commandes à exécuter côté serveur (comptes, firewall, modules) */
   followUp: string[];
+  /** avertissements bloquants à lire avant d'appliquer */
+  blocking: string[];
 }
 
 // ------------------------------------------------------------------ tables de correspondance
@@ -94,6 +96,7 @@ type Converter = (value: string, ctx: Ctx) => { key: string; value: string; note
 
 interface Ctx {
   section: string;
+  blocking: string[];
   isGlobal: boolean;
   report: ReportLine[];
   out: IniSection;
@@ -137,28 +140,33 @@ function protocol(v: string): string | undefined {
   return undefined;
 }
 
-function signingValue(v: string): string | undefined {
+/** Table Samba (enum_smb_signing_vals / enum_smb_encryption_vals) → options ksmbd. */
+function tristate(v: string): string | undefined {
   const s = v.trim().toLowerCase();
-  if (["mandatory", "required", "yes", "true", "on"].includes(s)) return "mandatory";
-  if (["auto", "default", "if_required", "desired", "allowed"].includes(s)) return "auto";
-  if (["disabled", "off", "no", "false"].includes(s)) return "disabled";
+  if (["yes", "true", "on", "1", "enabled", "auto", "if_required", "desired", "default", "allowed"].includes(s)) return "auto";
+  if (["required", "mandatory", "force", "forced", "enforced"].includes(s)) return "mandatory";
+  if (["no", "false", "off", "0", "disabled"].includes(s)) return "disabled";
   return undefined;
 }
-
-function encryptValue(v: string): string | undefined {
-  const s = v.trim().toLowerCase();
-  if (["required", "mandatory", "force", "yes", "true", "on"].includes(s)) return "mandatory";
-  if (["desired", "if_required", "auto", "default", "enabled"].includes(s)) return "auto";
-  if (["off", "no", "false", "disabled"].includes(s)) return "disabled";
-  return undefined;
-}
+const signingValue = tristate;
+const encryptValue = tristate;
 
 function userList(key: string): Converter {
   return (v, ctx) => {
     const notes: string[] = [];
     const out: string[] = [];
-    for (const raw of v.split(/[,\s]+/).filter(Boolean)) {
-      const e = raw.replace(/^"|"$/g, "");
+    // Samba accepte des entrées entre guillemets contenant des espaces ;
+    // ksmbd découpe sur espaces, virgules et tabulations : non représentables.
+    const tokens: string[] = [];
+    const re = /"([^"]*)"|([^,\s]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(v))) {
+      if (m[1] !== undefined) {
+        if (/[\s,]/.test(m[1])) notes.push(`« ${m[1]} » retiré (contient un espace ou une virgule : impossible à exprimer pour ksmbd)`);
+        else if (m[1]) tokens.push(m[1]);
+      } else tokens.push(m[2]!);
+    }
+    for (const e of tokens) {
       if (/^[+&]+/.test(e)) {
         out.push("@" + e.replace(/^[+&@]+/, ""));
         notes.push(`${e} → @${e.replace(/^[+&@]+/, "")}`);
@@ -173,29 +181,12 @@ function userList(key: string): Converter {
   };
 }
 
-function hostList(key: string): Converter {
+/** hosts allow / hosts deny : clés jamais lues par ksmbd-tools (KSMBD_SHARE_CONF_IS_BROKEN). */
+function hostDrop(key: string): Converter {
   return (v, ctx) => {
-    const kept: string[] = [];
-    const dropped: string[] = [];
-    let except = false;
-    for (const e of v.split(/[,\s]+/).filter(Boolean)) {
-      if (e.toUpperCase() === "EXCEPT") { except = true; dropped.push("EXCEPT…"); continue; }
-      if (except) { dropped.push(e); continue; }
-      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(e) || /^[0-9a-f:]+$/i.test(e) && e.includes(":")) kept.push(e);
-      else dropped.push(e);
-    }
-    if (dropped.length && !ctx.opts.hostsExactOnly) {
-      return { drop: `${key} contient des formes non gérées par ksmbd (${dropped.join(", ")}) : retiré entièrement par prudence` };
-    }
-    if (!kept.length) {
-      return { drop: `aucune adresse IP exacte (${dropped.join(", ")}) : ksmbd ne gère ni CIDR, ni préfixe, ni nom d'hôte, ni EXCEPT` +
-        (key === "hosts allow" ? " — ATTENTION : la restriction d'accès disparaît, filtrez au pare-feu" : "") };
-    }
-    return {
-      key, value: kept.join(" "), action: dropped.length ? "converted" : undefined,
-      note: dropped.length ? `gardé les IP exactes seulement ; retiré : ${dropped.join(", ")}` +
-        (key === "hosts allow" ? " (les clients de ces plages seront REFUSÉS)" : " (ces plages ne seront plus bloquées)") : undefined,
-    };
+    const msg = `${key} = ${v} : ksmbd-tools ignore cette clé (KSMBD_SHARE_CONF_IS_BROKEN). LA RESTRICTION D'ACCÈS DISPARAÎT : filtrez au pare-feu (firewalld / nftables) ou limitez l'écoute avec interfaces + bind interfaces only.`;
+    ctx.blocking.push(`[${ctx.section}] ${msg}`);
+    return { drop: msg };
   };
 }
 
@@ -212,7 +203,19 @@ const GLOBAL_MAP: Record<string, Converter> = {
   workgroup: same("workgroup"),
   serverstring: same("server string"),
   netbiosname: same("netbios name"),
-  interfaces: (v) => ({ key: "interfaces", value: v.split(/[,\s]+/).filter(Boolean).map((i) => i.split(/[;/]/)[0]).join(" "), note: "les adresses / options Samba (;speed=…) sont retirées : ksmbd attend des noms d'interface" }),
+  interfaces: (v) => {
+    const kept: string[] = [];
+    const dropped: string[] = [];
+    for (const raw of v.split(/[,\s]+/).filter(Boolean)) {
+      const name = raw.split(";")[0]!;
+      // une IP (v4 / v6, avec ou sans /masque) ou un réseau n'est pas un nom de netdev
+      if (/^\d{1,3}(\.\d{1,3}){3}(\/\d+)?$/.test(name) || name.includes(":") || name.includes("/")) dropped.push(raw);
+      else kept.push(name);
+    }
+    if (!kept.length) return { drop: `aucun nom d'interface (${dropped.join(", ")}) : ksmbd compare des noms de netdev, pas des adresses` };
+    return { key: "interfaces", value: kept.join(" "), action: dropped.length ? "converted" : undefined,
+      note: dropped.length ? `adresses retirées (ksmbd attend des noms d'interface) : ${dropped.join(", ")}` : undefined };
+  },
   bindinterfacesonly: boolTo("bind interfaces only"),
   guestaccount: same("guest account"),
   maptoguest: (v) => {
@@ -244,7 +247,6 @@ const GLOBAL_MAP: Record<string, Converter> = {
   smbencrypt: (v, ctx) => GLOBAL_MAP.serversmbencrypt!(v, ctx),
   deadtime: same("deadtime"),
   maxopenfiles: same("max open files"),
-  maxconnections: same("max connections"),
   smb2maxread: same("smb2 max read"),
   smb2maxwrite: same("smb2 max write"),
   smb2maxtrans: same("smb2 max trans"),
@@ -257,7 +259,12 @@ const GLOBAL_MAP: Record<string, Converter> = {
     const p = ports.includes("445") ? "445" : ports[0] ?? "445";
     return { key: "tcp port", value: p, action: "converted", note: ports.length > 1 ? `ksmbd n'écoute que sur un port : ${p} (139/NetBIOS n'existe pas)` : undefined };
   },
-  kerberosmethod: (v) => ({ key: "kerberos support", value: "yes", action: "converted", note: `kerberos method = ${v} : renseignez kerberos service name et kerberos keytab file` }),
+  kerberosmethod: (v) => {
+    const s = v.trim().toLowerCase();
+    if (["system keytab", "dedicated keytab", "secrets and keytab"].includes(s))
+      return { key: "kerberos support", value: "yes", action: "converted", note: `kerberos method = ${v} : renseignez kerberos service name et kerberos keytab file` };
+    return { drop: `kerberos method = ${v} n'utilise pas de keytab : Kerberos non activé` };
+  },
   dedicatedkeytabfile: same("kerberos keytab file"),
   rootdirectory: same("root directory"),
   "fruit:model": same("aapl model"),
@@ -310,18 +317,11 @@ const SHARE_MAP: Record<string, Converter> = {
   invalidusers: userList("invalid users"),
   readlist: userList("read list"),
   writelist: userList("write list"),
-  adminusers: (v, ctx) => {
-    const r = userList("admin users")(v, ctx);
-    if (r && "key" in r) {
-      r.note = [r.note, "ATTENTION : dans ksmbd, admin users court-circuite invalid users et ne donne pas les droits root"].filter(Boolean).join("; ");
-      r.action = "converted";
-    }
-    return r;
-  },
-  hostsallow: hostList("hosts allow"),
-  allowhosts: hostList("hosts allow"),
-  hostsdeny: hostList("hosts deny"),
-  denyhosts: hostList("hosts deny"),
+  adminusers: () => ({ drop: "aucun effet : ksmbd-tools ne lit pas « admin users » (KSMBD_SHARE_CONF_IS_BROKEN)" }),
+  hostsallow: hostDrop("hosts allow"),
+  allowhosts: hostDrop("hosts allow"),
+  hostsdeny: hostDrop("hosts deny"),
+  denyhosts: hostDrop("hosts deny"),
   createmask: octal("create mask"),
   createmode: octal("create mask"),
   directorymask: octal("directory mask"),
@@ -436,6 +436,17 @@ function convertSection(src: IniSection, ctx: Ctx, map: Record<string, Converter
       convertVfs(value, ctx);
       continue;
     }
+    if (nk === "fruit:timemachine" || (ctx.isGlobal && nk === "maxconnections")) continue; // traités après la section
+    if (/[;#]/.test(value) && nk !== "comment") {
+      add(ctx.report, { section: ctx.section, key: e.key, from: value, action: "dropped", note: "contient « ; » ou « # » : ksmbd-tools couperait la valeur à cet endroit" });
+      continue;
+    }
+    if (nk === "comment" && /[;#]/.test(value)) {
+      const kept = value.slice(0, value.search(/[;#]/)).trim();
+      if (kept) setValue(ctx.out, "comment", kept);
+      add(ctx.report, { section: ctx.section, key: e.key, from: value, to: kept ? `comment = ${kept}` : undefined, action: "converted", note: "tronqué au premier « ; » ou « # » (ksmbd-tools le couperait de toute façon)" });
+      continue;
+    }
     const conv = map[nk];
     if (conv) {
       const r = conv(value, ctx);
@@ -515,16 +526,62 @@ export function mergeSambaSources(smbConf: string, registry?: string): IniDocume
   return merged;
 }
 
+/**
+ * ksmbd accepte un membre de read list / write list SANS consulter valid users
+ * (tree_conn.c) ; Samba garde valid users comme filtre d'entrée. On signale (et
+ * optionnellement on retire) les entrées qui contourneraient valid users, ainsi
+ * que celles présentes dans les deux listes (ksmbd : lecture seule ; Samba : écriture).
+ */
+function checkAccessLists(name: string, share: IniSection, global: IniSection, opts: ConversionOptions, report: ReportLine[]) {
+  const list = (k: string) => (getValue(share, k) ?? getValue(global, k) ?? "").split(/[\s,]+/).filter(Boolean);
+  const valid = list("valid users");
+  const read = list("read list");
+  const write = list("write list");
+  const both = read.filter((e) => write.includes(e));
+  if (both.length) {
+    add(report, { section: name, key: "read list", action: "warning", note: `${both.join(", ")} dans read list ET write list : ksmbd donne la lecture seule (Samba donnait l'écriture)` });
+  }
+  if (!valid.length) return;
+  for (const k of ["read list", "write list"]) {
+    const entries = list(k);
+    const outside = entries.filter((e) => !valid.includes(e));
+    if (!outside.length) continue;
+    const groups = outside.filter((e) => e.startsWith("@"));
+    if (opts.intersectWithValidUsers) {
+      const kept = entries.filter((e) => valid.includes(e));
+      if (kept.length) setValue(share, k, kept.join(" "));
+      else deleteValue(share, k);
+      add(report, { section: name, key: k, from: entries.join(" "), to: kept.length ? `${k} = ${kept.join(" ")}` : "(retiré)", action: "converted",
+        note: `retiré ${outside.join(", ")} : absents de valid users, ils y auraient échappé dans ksmbd` +
+          (groups.length ? ` ; les groupes ne sont comparés que littéralement (${groups.join(", ")}) : vérifiez qu'aucun membre légitime n'est perdu` : "") });
+    } else {
+      add(report, { section: name, key: k, action: "warning",
+        note: `${outside.join(", ")} absents de valid users : ksmbd les acceptera quand même (read list / write list sont évaluées avant valid users)` });
+    }
+  }
+}
+
 export function convertSambaToKsmbd(sambaDoc: IniDocument, opts: ConversionOptions = defaultConversionOptions()): ConversionResult {
   const report: ReportLine[] = [];
-  const out: IniDocument = { sections: [] };
-  const outGlobal: IniSection = { name: "global", entries: [] };
+  const blocking: string[] = [];
+  const out: IniDocument = { sections: [], flavor: "ksmbd" };
+  const outGlobal: IniSection = { name: "global", entries: [], flavor: "ksmbd" };
   out.sections.push(outGlobal);
   const srcGlobal = findSection(sambaDoc, "global");
   const followUp: string[] = [];
 
   if (srcGlobal) {
-    convertSection(srcGlobal, { section: "global", isGlobal: true, report, out: outGlobal, outGlobal, opts, src: srcGlobal, srcGlobal }, GLOBAL_MAP, GLOBAL_DROP, SHARE_MAP);
+    convertSection(srcGlobal, { section: "global", isGlobal: true, blocking, report, out: outGlobal, outGlobal, opts, src: srcGlobal, srcGlobal }, GLOBAL_MAP, GLOBAL_DROP, SHARE_MAP);
+  }
+  // bind interfaces only sans interface valide : ksmbd n'écouterait plus nulle part
+  if (getValue(outGlobal, "bind interfaces only") === "yes" && !getValue(outGlobal, "interfaces")) {
+    deleteValue(outGlobal, "bind interfaces only");
+    add(report, { section: "global", key: "bind interfaces only", from: "yes", action: "dropped", note: "aucune interface convertie (adresses IP non reconnues par ksmbd) : ksmbd écoutera sur toutes les interfaces" });
+  }
+  // max connections de Samba en [global] = défaut PAR PARTAGE ; dans ksmbd ce serait un plafond serveur
+  const globalMaxConn = getValue(srcGlobal, "max connections")?.trim();
+  if (globalMaxConn) {
+    add(report, { section: "global", key: "max connections", from: globalMaxConn, to: "recopié dans chaque partage", action: "converted", note: "en [global] Samba c'est le défaut de chaque partage ; en [global] ksmbd ce serait un plafond pour tout le serveur" });
   }
 
   const timeMachineShares: string[] = [];
@@ -547,9 +604,17 @@ export function convertSambaToKsmbd(sambaDoc: IniDocument, opts: ConversionOptio
       add(report, { section: s.name, action: "skipped-section", note: "available = no dans Samba" });
       continue;
     }
-    const outShare: IniSection = { name: s.name, entries: [] };
-    const ctx: Ctx = { section: s.name, isGlobal: false, report, out: outShare, outGlobal, opts, src: s, srcGlobal };
+    const outShare: IniSection = { name: s.name, entries: [], flavor: "ksmbd" };
+    const ctx: Ctx = { section: s.name, isGlobal: false, blocking, report, out: outShare, outGlobal, opts, src: s, srcGlobal };
     convertSection(s, ctx, SHARE_MAP, SHARE_DROP, {});
+    if (globalMaxConn && !getValue(outShare, "max connections") && /^\d+$/.test(globalMaxConn)) {
+      setValue(outShare, "max connections", globalMaxConn);
+    }
+    // Samba suit les liens symboliques par défaut, ksmbd non
+    if (getValue(s, "follow symlinks") === undefined && getValue(srcGlobal, "follow symlinks") === undefined && !getValue(outShare, "follow symlinks")) {
+      add(report, { section: s.name, key: "follow symlinks", action: "warning", note: "non défini : Samba suit les liens symboliques par défaut, ksmbd non (follow symlinks = no). Ajoutez « follow symlinks = yes » si le partage en contient." });
+    }
+    checkAccessLists(s.name, outShare, outGlobal, opts, report);
 
     // Time Machine (fruit:time machine)
     const tm = getValue(s, "fruit:time machine") ?? getValue(srcGlobal, "fruit:time machine");
@@ -583,7 +648,7 @@ export function convertSambaToKsmbd(sambaDoc: IniDocument, opts: ConversionOptio
     const cm = parseInt(getValue(outShare, "create mask") ?? getValue(outGlobal, "create mask") ?? "0744", 8);
     const fcm = parseInt(getValue(outShare, "force create mode") ?? "0", 8);
     if ((cm | fcm) & 0o020) {
-      add(report, { section: s.name, key: "create mask", action: "warning", note: "écriture groupe demandée : les workers ksmbd ont un umask 0022, appliqué si le dossier parent n'a pas d'ACL POSIX par défaut (toujours en acltype=off). Posez une ACL par défaut (setfacl -d -m g::rwx) sur la racine du partage." });
+      add(report, { section: s.name, key: "create mask", action: "warning", note: "écriture groupe demandée : l'umask des workers ksmbd (0022 sur les noyaux récents, vérifiez avec « grep Umask /proc/$(pgrep -x kthreadd)/status ») est appliqué si le dossier parent n'a pas d'ACL POSIX par défaut (toujours en acltype=off). Posez une ACL par défaut (setfacl -d -m g::rwx) sur la racine du partage." });
     }
     out.sections.push(outShare);
   }
@@ -637,24 +702,29 @@ export function convertSambaToKsmbd(sambaDoc: IniDocument, opts: ConversionOptio
     );
   }
 
-  // comptes
+  // comptes de connexion (force user n'en a pas besoin : seulement un compte Unix)
   const users = new Set<string>();
+  const forced = new Set<string>();
   for (const s of out.sections) {
-    for (const k of ["valid users", "write list", "read list", "admin users", "force user"]) {
+    for (const k of ["valid users", "write list", "read list"]) {
       for (const u of (getValue(s, k) ?? "").split(/\s+/).filter((x) => x && !x.startsWith("@"))) users.add(u);
     }
+    const fu = getValue(s, "force user");
+    if (fu) forced.add(fu);
   }
   followUp.unshift(
     "# Comptes : les mots de passe Samba ne sont pas migrables",
     ...[...users].map((u) => `ksmbd.adduser -a ${u}`),
     "# Pour chaque membre des groupes @… utilisés : ksmbd.adduser -a <compte>",
+    ...(forced.size ? [`# force user (${[...forced].join(", ")}) : doit seulement exister comme compte Unix (getent passwd), pas de ksmbd.adduser`] : []),
     "systemctl disable --now smb nmb 2>/dev/null; systemctl disable --now smbd nmbd 2>/dev/null",
-    "systemctl enable --now ksmbd && ksmbd.control --reload",
+    "# démarrage complet : les paramètres [global] ne sont lus qu'au démarrage de ksmbd.mountd (pas par --reload)",
+    "systemctl enable ksmbd && systemctl restart ksmbd",
   );
 
   const text = serializeIni(out, [
     "ksmbd.conf généré par cockpit-file-sharing (conversion depuis Samba)",
     `le ${new Date().toISOString().slice(0, 10)} — voir ksmbd.conf(5)`,
   ]);
-  return { doc: out, text, report, followUp };
+  return { doc: out, text, report, followUp, blocking };
 }

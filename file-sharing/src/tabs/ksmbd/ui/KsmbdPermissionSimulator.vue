@@ -10,11 +10,12 @@ import { getValue, findSection } from "../ini";
 import { evaluateTreeConnect, effectiveIdentity, computeCreate, accessLayers, effectiveShare, type UserDb, type StackStep } from "../permission-stack";
 import type { KsmbdManager, PathProbe } from "../ksmbd-manager";
 
-const props = defineProps<{ doc: IniDocument; db: UserDb; manager: KsmbdManager }>();
+const props = defineProps<{ doc: IniDocument; db: UserDb; manager: KsmbdManager; workerUmask?: number | null }>();
 
 const shares = computed(() => props.doc.sections.filter((s) => s.name.toLowerCase() !== "global" && s.name.toLowerCase() !== "ipc$").map((s) => s.name));
 const ctx = reactive({ share: "", account: "", peerAddr: "192.168.0.10", guestSession: false, badPassword: false });
-const create = reactive({ kind: "file" as "file" | "dir", posixMode: "", posixAclFs: true, parentHasDefaultAcl: false, parentHasInheritableNtAcl: false, parentSetgid: false, parentOwner: "", parentGroup: "", clientSendsSecurityDescriptor: false, umask: "0022" });
+const create = reactive({ kind: "file" as "file" | "dir", posixMode: "", posixAclFs: true, parentHasDefaultAcl: false, parentHasInheritableNtAcl: false, parentSetgid: false, parentOwner: "", parentGroup: "", clientSendsSecurityDescriptor: false, umask: "" });
+watch(() => props.workerUmask, (u) => { if (u !== null && u !== undefined) create.umask = u.toString(8).padStart(4, "0"); }, { immediate: true });
 const pathProbe = ref<PathProbe | null>(null);
 const probing = ref(false);
 
@@ -49,7 +50,7 @@ const created = computed(() =>
     ? computeCreate(props.doc, ctx.share, ctx.account, props.db, {
         ...create,
         posixMode: create.posixMode ? parseInt(create.posixMode, 8) : undefined,
-        umask: parseInt(create.umask || "0022", 8),
+        umask: parseInt(create.umask || "0022", 8) || 0,
       })
     : null
 );
@@ -58,9 +59,9 @@ const eff = computed(() => (ctx.share ? effectiveShare(props.doc, ctx.share) : {
 const overridden = computed(() => Object.entries(eff.value).filter(([, v]) => v.origin !== "default" && v.value));
 
 const effectClass = (s: StackStep) =>
-  ({ deny: "text-danger", ro: "text-warning", rw: "text-success", bind: "text-success", pass: "text-muted", info: "" })[s.effect];
+  ({ deny: "text-danger", ro: "text-warning", rw: "text-success", bind: "text-success", pass: "text-muted", info: "", ignored: "text-muted line-through" })[s.effect];
 const effectLabel = (s: StackStep) =>
-  ({ deny: "REFUS", ro: "lecture seule", rw: "écriture", bind: "accepté", pass: "suite", info: "" })[s.effect];
+  ({ deny: "REFUS", ro: "lecture seule", rw: "écriture", bind: "accepté", pass: "suite", info: "", ignored: "ignoré" })[s.effect];
 const statusLabel = (s?: string) => ({ deny: "Refusé", ro: "Lecture seule", rw: "Lecture-écriture" })[s ?? "deny"];
 const oct = (n: number) => n.toString(8).padStart(4, "0");
 const sym = (m: number) =>
@@ -96,7 +97,6 @@ const sym = (m: number) =>
       <div class="text-header">
         1. Connexion au partage :
         <span :class="connect.status === 'deny' ? 'text-danger' : connect.status === 'ro' ? 'text-warning' : 'text-success'">{{ statusLabel(connect.status) }}</span>
-        <span v-if="connect.admin" class="text-xs text-muted ml-2">(admin users)</span>
         <span v-if="connect.guest" class="text-xs text-muted ml-2">(invité : {{ connect.effectiveAccount }})</span>
       </div>
       <table class="w-full mt-2">
@@ -114,7 +114,8 @@ const sym = (m: number) =>
         <li v-for="w in connect.warnings" :key="w">{{ w }}</li>
       </ul>
       <p class="text-xs text-muted mt-2">
-        Ordre réel de ksmbd-tools : hôtes → invité → compte ksmbd → admin users → invalid users → read list → write list → valid users.
+        Ordre réel de ksmbd-tools : mot de passe → invité → compte ksmbd → invalid users → read list → write list → valid users.
+        hosts allow, hosts deny et admin users sont ignorés par ksmbd-tools actuel (KSMBD_SHARE_CONF_IS_BROKEN).
         Les @groupes sont développés au chargement de la configuration : après un changement de groupe Unix, exécutez « ksmbd.control --reload ».
       </p>
     </div>
@@ -151,7 +152,7 @@ const sym = (m: number) =>
           <option value="dir">Dossier</option>
         </select>
         <input v-model="create.posixMode" class="input-textlike font-mono" placeholder="mode client POSIX (vide = Windows/macOS)" />
-        <input v-model="create.umask" class="input-textlike font-mono" title="umask des workers ksmbd (init_fs : 0022)" />
+        <input v-model="create.umask" class="input-textlike font-mono" :title="workerUmask != null ? 'umask lu sur le serveur (kthreadd)' : 'umask non lu : 0022 sur les noyaux récents'" placeholder="umask (0022)" />
         <span></span>
         <label class="flex items-center gap-1"><input type="checkbox" v-model="create.posixAclFs" /> FS avec ACL POSIX</label>
         <label class="flex items-center gap-1"><input type="checkbox" v-model="create.parentHasDefaultAcl" /> parent : ACL par défaut</label>
@@ -161,8 +162,12 @@ const sym = (m: number) =>
       </div>
       <template v-if="created">
         <div class="font-mono">
-          Résultat : {{ oct(created.mode) }} ({{ sym(created.mode) }}) — {{ created.owner }}:{{ created.group }} — ACL : {{ created.acl }}
+          Résultat : {{ oct(created.statMode) }} ({{ sym(created.statMode) }}{{ created.effective ? '+' : '' }}) — {{ created.owner }}:{{ created.group }}
         </div>
+        <div v-if="created.effective" class="text-xs text-muted">
+          Mode vu par stat : bits groupe = masque de l'ACL. Droits effectifs : {{ created.effective }}.
+        </div>
+        <div class="text-xs font-mono">ACL : {{ created.acl }}</div>
         <div v-for="(s, i) in created.steps" :key="i" class="flex gap-2">
           <span class="w-48">{{ s.label }}</span>
           <span class="font-mono text-xs w-56 break-all">{{ s.param ? `${s.param} = ${s.value}` : '' }}</span>
