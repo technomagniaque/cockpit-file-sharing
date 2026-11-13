@@ -69,6 +69,9 @@ function valueWarning(p: KsmbdParam): string | undefined {
     const bad = v.split(/[\s,]+/).filter((h) => /^\d{1,3}(\.\d{1,3}){3}/.test(h) || h.includes(":") || h.includes("/"));
     if (bad.length) return `noms d'interface attendus, pas d'adresses : ${bad.join(", ")}`;
   }
+  if (["valid users", "invalid users", "read list", "write list", "force user", "force group"].includes(p.key) && v.includes("/")) {
+    return "nom d'utilisateur ou @groupe attendu, pas un chemin de dossier (utilisez « path » dans Général)";
+  }
   return undefined;
 }
 function toggleListValue(p: KsmbdParam, item: string) {
@@ -89,7 +92,7 @@ function toggleListValue(p: KsmbdParam, item: string) {
       </label>
     </div>
 
-    <details v-for="g in groups" :key="g.cat" class="rounded-lg border border-default px-3 py-2" :open="g.cat === 'access' || g.cat === 'rdma'">
+    <details v-for="g in groups" :key="g.cat" class="rounded-lg border border-default px-3 py-2" :open="g.cat === 'general' || g.cat === 'access' || g.cat === 'rdma'">
       <summary class="cursor-pointer text-label">{{ g.label }}</summary>
       <div class="mt-2 grid grid-cols-1 lg:grid-cols-2 gap-x-6 gap-y-3">
         <div v-for="p in g.params" :key="p.key">
