@@ -286,7 +286,12 @@ suite("conversion Samba → ksmbd", () => {
   test("RDMA et multicanal", () => {
     expect(getValue(g, "server multi channel support")).toBe("yes");
     expect(getValue(g, "smbd max io size")).toBe("8MB");
-    expect(res.followUp.join("\n")).toContain("5445");
+    const fu = res.followUp.join("\n");
+    expect(fu).toContain("5445");
+    // règle pare-feu persistante et limitée au réseau local, jamais une règle nft à chaud ouverte à tous
+    expect(fu).not.toContain("nft add rule");
+    expect(fu).toContain("--permanent --add-rich-rule");
+    expect(fu).toContain("source address=");
   });
   test("hosts allow et admin users abandonnés avec avertissement bloquant", () => {
     expect(getValue(p, "hosts allow")).toBeUndefined();

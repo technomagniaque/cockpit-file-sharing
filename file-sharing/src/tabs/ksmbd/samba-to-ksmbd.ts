@@ -673,7 +673,10 @@ export function convertSambaToKsmbd(sambaDoc: IniDocument, opts: ConversionOptio
       "rdma link show            # le port doit être ACTIVE (qedr pour la QL41112)",
       "ibv_devinfo               # paquet rdma-core / ibverbs-utils (Debian 13)",
       "# Port SMB Direct : 445 en InfiniBand / RoCE ; 5445 dès qu'un RNIC iWARP est présent (iWARP = espace de ports TCP, à ouvrir au pare-feu)",
-      "nft add rule inet filter input tcp dport 5445 accept 2>/dev/null || { firewall-cmd --permanent --add-port=5445/tcp && firewall-cmd --reload; }",
+      "# Pare-feu, de façon PERSISTANTE et limitée au réseau local (remplacer <réseau>, ex. 192.168.0.0/24) :",
+      "#   firewalld actif (firewall-cmd --state) :",
+      "#     firewall-cmd --permanent --add-rich-rule='rule family=\"ipv4\" source address=\"<réseau>\" port port=\"5445\" protocol=\"tcp\" accept' && firewall-cmd --reload",
+      "#   sinon nftables : dans la chaîne input de /etc/nftables.conf, « ip saddr <réseau> tcp dport 5445 accept », puis systemctl reload nftables",
     );
   }
   const ifaces = [...new Set([...opts.rdma.interfaces, ...opts.extraInterfaces].filter(Boolean))];
