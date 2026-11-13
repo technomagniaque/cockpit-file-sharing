@@ -11,16 +11,33 @@
  *    empêche l'octroi des oplocks ET des baux : smb2pdu.c smb2_open teste
  *    KSMBD_SHARE_FLAG_OPLOCKS et n'appelle alors pas smb_grant_oplock.
  *  - Délégations NFSv4 : ce sont des baux noyau (fs/nfsd/nfs4state.c,
- *    kernel_setlease). ksmbd ouvre par dentry_open → do_dentry_open →
- *    break_lease (fs/open.c) : une ouverture SMB rappelle la délégation
- *    (attente jusqu'au retour du client NFS). Suppression / renommage SMB :
- *    vfs_unlink / vfs_rename sans delegated_inode → try_break_deleg non
- *    bloquant → -EWOULDBLOCK renvoyé au client SMB, qui réessaie.
+ *    kernel_setlease). ksmbd ouvre avec O_NONBLOCK (smb2pdu.c smb2_open :
+ *    « oflags = O_NONBLOCK | O_LARGEFILE ») : __break_lease lance le rappel
+ *    puis renvoie -EWOULDBLOCK SANS attendre ; en 6.12 l'erreur n'est pas
+ *    traduite et le client reçoit STATUS_UNEXPECTED_IO_ERROR (7.4 :
+ *    STATUS_FILE_NOT_AVAILABLE). Cas : ouverture SMB en écriture d'un fichier
+ *    délégué en lecture, toute ouverture d'un fichier délégué en écriture.
+ *    lease-break-time ne s'applique pas (nfsd_break_deleg_cb met
+ *    fl_break_time = 0).
+ *  - Suppression à la fermeture (delete-on-close) : __ksmbd_inode_close →
+ *    ksmbd_vfs_unlink → vfs_unlink(..., NULL) → -EWOULDBLOCK, consigné
+ *    seulement en debug, la fermeture répond succès : le fichier « revient ».
+ *  - Renommage / setattr : ksmbd_vfs_rename et notify_change sans
+ *    delegated_inode → -EAGAIN → STATUS_FILE_LOCK_CONFLICT (smb2_set_info),
+ *    sans nouvel essai automatique connu côté Windows.
+ *  - Seul remède : sysctl fs.leases-enable=0 (fs/locks.c generic_add_lease :
+ *    refuse les NOUVEAUX baux, donc les délégations nfsd, les layouts pNFS et
+ *    F_SETLEASE ; global à l'hôte ; à poser avant nfsd puis redémarrer
+ *    nfs-server). Aucun réglage nfsd dédié.
+ *  - NFSv3 : pas de délégations, mais verrous NLM = verrous POSIX
+ *    (fs/lockd/svclock.c → vfs_lock_file) : mêmes interactions avec ksmbd.
  *  - Verrous de plage : ksmbd les pose en verrous POSIX noyau
  *    (smb2pdu.c smb2_lock → vfs_lock_file), visibles par les verrous NFS ;
  *    les lectures / écritures SMB respectent tout verrou POSIX, y compris
- *    ceux des clients NFS (vfs.c check_lock_range). Les E/S NFS ignorent les
- *    verrous (consultatifs).
+ *    ceux des clients NFS (vfs.c check_lock_range) : un verrou PARTAGÉ posé
+ *    par NFS ou un processus local bloque toute écriture SMB sur la plage
+ *    (échec immédiat STATUS_FILE_LOCK_CONFLICT, pr_err par E/S refusée).
+ *    Les E/S NFS ignorent les verrous (consultatifs).
  *  - Modes de partage (deny read / deny write) : liste interne à ksmbd
  *    (smb_common.c ksmbd_smb_check_shared_mode) ; les « deny » NFSv4 sont
  *    internes à nfsd (nfs4state.c st_deny_bmap). Aucune exclusion croisée.
@@ -49,6 +66,17 @@ export interface DualFinding {
 
 export type PathRelation = "same" | "nfs-parent" | "smb-parent" | "none";
 
+/** Commande et fichier sysctl à proposer pour un serveur double protocole. */
+export const LEASES_SYSCTL = {
+  file: "/etc/sysctl.d/99-nfs-ksmbd.conf",
+  content: "fs.leases-enable = 0\n",
+  commands: [
+    "echo 'fs.leases-enable = 0' > /etc/sysctl.d/99-nfs-ksmbd.conf",
+    "sysctl -p /etc/sysctl.d/99-nfs-ksmbd.conf",
+    "systemctl restart nfs-server   # les délégations déjà accordées restent jusqu'au redémarrage",
+  ],
+};
+
 export function normPath(p: string): string {
   const n = ("/" + p.trim()).replace(/\/+/g, "/").replace(/\/$/, "");
   return n || "/";
@@ -64,10 +92,14 @@ export function pathRelation(smbPath: string, nfsPath: string): PathRelation {
 }
 
 /** Exports NFS qui recoupent le chemin d'un partage ksmbd. */
-export function overlappingExports(smbPath: string, exports: NFSExport[]): { export: NFSExport; relation: PathRelation }[] {
+/**
+ * @param resolve chemin résolu côté serveur (readlink -f) ; à défaut, la
+ *                chaîne normalisée (un lien symbolique échapperait au rapprochement).
+ */
+export function overlappingExports(smbPath: string, exports: NFSExport[], resolve: (p: string) => string = (p) => p): { export: NFSExport; relation: PathRelation }[] {
   if (!smbPath) return [];
   return exports
-    .map((e) => ({ export: e, relation: pathRelation(smbPath, e.path) }))
+    .map((e) => ({ export: e, relation: pathRelation(resolve(smbPath), resolve(e.path)) }))
     .filter((x) => x.relation !== "none");
 }
 
@@ -94,6 +126,14 @@ export interface DualContext {
   rootHasDefaultAcl?: boolean;
   /** umask des workers ksmbd (sonde) */
   workerUmask?: string;
+  /** /proc/sys/fs/leases-enable (undefined = inconnu, supposé actif) */
+  leasesEnable?: boolean;
+  /** NFSv3 servi (versions globales) */
+  nfsV3?: boolean;
+  /** NFSv4 servi */
+  nfsV4?: boolean;
+  /** résolution des chemins côté serveur */
+  resolve?: (p: string) => string;
 }
 
 export function analyzeDualProtocol(ctx: DualContext): DualFinding[] {
@@ -103,7 +143,11 @@ export function analyzeDualProtocol(ctx: DualContext): DualFinding[] {
   const eff = effectiveShare(ctx.doc, ctx.share);
   const v = (k: string) => eff[k]?.value ?? "";
   const smbPath = v("path");
-  const rel = pathRelation(smbPath, ctx.nfsExport.path);
+  const res = ctx.resolve ?? ((p: string) => p);
+  const rel = pathRelation(res(smbPath), res(ctx.nfsExport.path));
+  const v4 = ctx.nfsV4 ?? true;
+  const v3 = ctx.nfsV3 ?? true;
+  const leasesOn = ctx.leasesEnable !== false;
   if (rel === "none") return out;
   const where = rel === "same" ? "même chemin" : rel === "nfs-parent" ? `l'export ${ctx.nfsExport.path} contient le partage` : `le partage contient l'export ${ctx.nfsExport.path}`;
 
@@ -120,25 +164,47 @@ export function analyzeDualProtocol(ctx: DualContext): DualFinding[] {
       ref: "fs/smb/server/oplock.c (pas de vfs_setlease) ; smb2pdu.c smb2_open (KSMBD_SHARE_FLAG_OPLOCKS)",
     });
   } else {
-    out.push({ id: "oplocks", level: "info", title: "oplocks = no : cache client SMB désactivé", detail: "Chaque lecture / écriture SMB va au serveur : cohérent avec NFS, au prix de performances plus faibles pour les petits fichiers. Les poignées durables (reprise après coupure) ne sont plus accordées sur ce partage." });
+    out.push({ id: "oplocks", level: "info", title: "oplocks = no : cache client SMB désactivé", detail: "Chaque lecture / écriture SMB va au serveur : cohérent avec NFS, au prix de performances plus faibles pour les petits fichiers." });
   }
-  out.push({
-    id: "delegations",
-    level: "info",
-    title: "Délégations NFSv4 rappelées par les accès SMB",
-    detail: "Les délégations NFS sont des baux noyau : une ouverture SMB les rappelle et attend la réponse du client NFS (jusqu'au délai lease-break-time). Une suppression ou un renommage SMB d'un fichier délégué échoue temporairement (-EWOULDBLOCK) le temps du rappel.",
-    fix: "Si des ouvertures SMB se figent : désactiver les délégations (sysctl fs.leases-enable=0, effet sur tout le système). Aucun réglage nfsd dédié dans ce noyau.",
-    ref: "fs/open.c do_dentry_open → break_lease ; include/linux/filelock.h try_break_deleg ; fs/locks.c leases_enable",
-  });
+  if (ksmbdBool(globalValue(ctx.doc, "durable handles"))) {
+    out.push({ id: "durable", level: "info", title: "Poignées durables actives", detail: "Accordées selon la demande du client, indépendamment de oplocks = no : après une coupure, une poignée orpheline garde le fichier ouvert au moins 60 s (modes de partage et verrous compris), ce qui peut bloquer un client NFS ou SMB.", ref: "fs/smb/server/smb2pdu.c smb2_open (is_durable)" });
+  }
+  out.push({ id: "attrcache", level: "info", title: "Caches d'attributs non couverts", detail: "oplocks = no ne couvre ni le cache d'attributs NFS (actimeo, cohérence garantie seulement fermeture → ouverture) ni le cache de métadonnées du client Windows (~10 s) : un changement fait d'un côté peut mettre quelques secondes à apparaître de l'autre. Le change attribute NFSv4 sur ZFS repose sur ctime (granularité possiblement grossière en 6.12, non vérifié)." });
+
+  if (v4) {
+    if (leasesOn) {
+      out.push({
+        id: "delegations",
+        level: "warning",
+        title: "Délégations NFSv4 : ouvertures SMB en échec",
+        detail: "ksmbd ouvre en O_NONBLOCK : face à une délégation NFS, le rappel est lancé mais l'ouverture échoue aussitôt (-EWOULDBLOCK) au lieu d'attendre. En 6.12 le client SMB reçoit STATUS_UNEXPECTED_IO_ERROR (7.4 : STATUS_FILE_NOT_AVAILABLE). Touche toute ouverture SMB en écriture d'un fichier délégué en lecture, et toute ouverture d'un fichier délégué en écriture. Renommage et changement d'attributs : STATUS_FILE_LOCK_CONFLICT, sans nouvel essai automatique côté Windows. lease-break-time ne s'applique pas (nfsd fixe fl_break_time à 0).",
+        fix: `sysctl fs.leases-enable=0 sur ce serveur (persistant : ${LEASES_SYSCTL.file}), à poser AVANT nfsd puis systemctl restart nfs-server. Global à l'hôte : coupe aussi les layouts pNFS et F_SETLEASE. Aucun réglage nfsd dédié.`,
+        ref: "smb2pdu.c smb2_open (O_NONBLOCK) ; fs/locks.c __break_lease, generic_add_lease ; fs/nfsd/nfs4state.c nfsd_break_deleg_cb",
+      });
+      out.push({
+        id: "deleteonclose",
+        level: "danger",
+        title: "Suppression SMB d'un fichier délégué : échec silencieux",
+        detail: "Une suppression SMB (delete-on-close, l'Explorateur et la plupart des applications) d'un fichier qu'un client NFS a en délégation échoue dans vfs_unlink (-EWOULDBLOCK), n'est consignée qu'en debug, et la fermeture répond « succès » : le fichier « revient ».",
+        fix: `fs.leases-enable=0 (${LEASES_SYSCTL.file}) puis systemctl restart nfs-server.`,
+        ref: "fs/smb/server/vfs_cache.c __ksmbd_inode_close → vfs.c ksmbd_vfs_unlink → vfs_unlink(..., NULL)",
+      });
+    } else {
+      out.push({ id: "delegations", level: "info", title: "Délégations NFSv4 désactivées (fs.leases-enable=0)", detail: "Pas de conflit délégation / ksmbd. Les délégations accordées avant le réglage disparaissent au redémarrage de nfs-server." });
+    }
+  }
 
   // 2. verrous et modes de partage
   out.push({
     id: "locks",
-    level: "info",
+    level: "warning",
     title: "Verrous de plage partagés",
-    detail: "Les verrous SMB sont des verrous POSIX noyau, en conflit avec les verrous NFS. Les lectures / écritures SMB respectent les verrous NFS ; l'inverse n'est pas vrai (les E/S NFS ignorent les verrous, comme toujours sous Unix).",
-    ref: "smb2pdu.c smb2_lock → vfs_lock_file ; vfs.c check_lock_range",
+    detail: `Les verrous SMB sont des verrous POSIX noyau, en conflit avec les verrous NFS${v3 ? " (y compris NLM des clients NFSv3)" : ""}. Les lectures / écritures SMB respectent les verrous NFS : un verrou même PARTAGÉ posé par un client NFS ou un processus local bloque toute écriture SMB sur la plage (échec immédiat STATUS_FILE_LOCK_CONFLICT, un message noyau par E/S refusée, qui peut inonder dmesg). L'inverse n'est pas vrai : les E/S NFS ignorent les verrous.`,
+    ref: `smb2pdu.c smb2_lock → vfs_lock_file ; vfs.c check_lock_range${v3 ? " ; fs/lockd/svclock.c nlmsvc_lock → vfs_lock_file" : ""}`,
   });
+  if (v3) {
+    out.push({ id: "nlm", level: "info", title: "NFSv3 : pas de délégations, mais NLM", detail: "Les clients v3 n'ont pas de délégations (le risque de cache SMB non rappelé reste : oplocks = no toujours nécessaire) ; leurs verrous passent par lockd / NLM et statd, en conflit avec les verrous SMB comme ci-dessus. Après un redémarrage du serveur, la période de grâce ne concerne que lockd / nfsd : ksmbd ne la respecte pas, un client SMB peut donc prendre un verrou qu'un client NFS cherche à récupérer.", ref: "fs/lockd/svclock.c locks_in_grace (aucune vérification équivalente dans fs/smb/server)" });
+  }
   out.push({
     id: "sharemodes",
     level: "warning",
@@ -258,9 +324,10 @@ export function applyDualProtocolRecommendations(doc: IniDocument, share: string
       changes.push("acl_xattr vient de [global] et ne peut pas être annulé par une valeur vide : retirez-le de [global]");
     }
   }
-  if (ksmbdBool(getValue(sec, "time machine"))) {
+  if (ksmbdBool(effectiveShare(doc, share)["time machine"]?.value)) {
     setValue(sec, "time machine", "no");
-    changes.push("time machine = no");
+    changes.push(ksmbdBool(getValue(findSection(doc, "global"), "time machine")) ? "time machine = no (surcharge la valeur héritée de [global])" : "time machine = no");
   }
+  changes.push(`Hors plugin (à confirmer) : fs.leases-enable=0 — ${LEASES_SYSCTL.commands.join(" ; ")}`);
   return changes;
 }

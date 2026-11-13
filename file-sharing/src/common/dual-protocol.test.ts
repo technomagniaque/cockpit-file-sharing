@@ -45,6 +45,41 @@ suite("constats double protocole", () => {
     expect(byId.force!.fix).toContain("anonuid=900");
     expect(byId.umask!.level).toBe("warning");
     expect(byId.sharemodes!.level).toBe("warning");
+    // C1 / C2 : délégations actives par défaut
+    expect(byId.delegations!.level).toBe("warning");
+    expect(byId.delegations!.detail).toContain("O_NONBLOCK");
+    expect(byId.delegations!.detail).not.toContain("attend la réponse");
+    expect(byId.deleteonclose!.level).toBe("danger");
+    expect(byId.deleteonclose!.fix).toContain("fs.leases-enable=0");
+    // NFSv3 actif par défaut : NLM
+    expect(byId.nlm).toBeDefined();
+    expect(byId.locks!.detail).toContain("PARTAGÉ");
+  });
+  test("C4 : fs.leases-enable=0 retire les constats de délégation", () => {
+    const f = analyzeDualProtocol({ doc, share: "data", nfsExport: exp("/tank/data", "", [["*", "rw"]]), leasesEnable: false });
+    const byId = Object.fromEntries(f.map((x) => [x.id, x]));
+    expect(byId.delegations!.level).toBe("info");
+    expect(byId.deleteonclose).toBeUndefined();
+  });
+  test("NFSv4 coupé : pas de constat délégation ; NFSv3 coupé : pas de NLM", () => {
+    const f1 = analyzeDualProtocol({ doc, share: "data", nfsExport: exp("/tank/data", ""), nfsV4: false });
+    expect(f1.some((x) => x.id === "delegations")).toBe(false);
+    const f2 = analyzeDualProtocol({ doc, share: "data", nfsExport: exp("/tank/data", ""), nfsV3: false });
+    expect(f2.some((x) => x.id === "nlm")).toBe(false);
+  });
+  test("C5 : poignées durables signalées indépendamment de oplocks", () => {
+    const d = parseIni("[global]\n\tdurable handles = yes\n[s]\n\tpath = /tank/s\n\toplocks = no\n", "ksmbd");
+    const f = analyzeDualProtocol({ doc: d, share: "s", nfsExport: exp("/tank/s", "") });
+    const byId = Object.fromEntries(f.map((x) => [x.id, x]));
+    expect(byId.durable!.detail).toContain("60 s");
+    expect(byId.oplocks!.detail).not.toContain("durables");
+  });
+  test("C14 : chemins comparés après résolution", () => {
+    const d = parseIni("[s]\n\tpath = /srv/lien\n", "ksmbd");
+    const resolve = (p: string) => (p === "/srv/lien" ? "/tank/s" : p);
+    expect(analyzeDualProtocol({ doc: d, share: "s", nfsExport: exp("/tank/s", "") })).toEqual([]);
+    expect(analyzeDualProtocol({ doc: d, share: "s", nfsExport: exp("/tank/s", ""), resolve }).length).toBeGreaterThan(0);
+    expect(overlappingExports("/srv/lien", [exp("/tank/s", "")], resolve).length).toBe(1);
   });
   test("force user cohérent avec all_squash + anonuid", () => {
     const f = analyzeDualProtocol({ doc, share: "data", nfsExport: exp("/tank/data", "", [["*", "rw,all_squash,anonuid=900"]]), db, rootHasDefaultAcl: true });
@@ -71,13 +106,20 @@ suite("réglages recommandés", () => {
     const s = findSection(doc, "data")!;
     expect(getValue(s, "oplocks")).toBe("no");
     expect(getValue(s, "vfs objects")).toBe("streams_xattr");
-    expect(ch.length).toBe(2);
+    expect(ch.length).toBe(3);
+    expect(ch[2]).toContain("fs.leases-enable=0");
   });
   test("acl_xattr hérité de [global] seul : signalé, pas d'annulation impossible", () => {
     const doc = parseIni(ksmbd, "ksmbd");
     const ch = applyDualProtocolRecommendations(doc, "tm");
     expect(ch.some((c) => c.includes("[global]"))).toBe(true);
     expect(getValue(findSection(doc, "tm")!, "time machine")).toBe("no");
+  });
+  test("C13 : time machine hérité de [global]", () => {
+    const doc = parseIni("[global]\n\ttime machine = yes\n[s]\n\tpath = /tank/s\n", "ksmbd");
+    const ch = applyDualProtocolRecommendations(doc, "s");
+    expect(getValue(findSection(doc, "s")!, "time machine")).toBe("no");
+    expect(ch.some((c) => c.includes("héritée de [global]"))).toBe(true);
   });
 });
 

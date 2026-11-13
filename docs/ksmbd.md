@@ -99,3 +99,10 @@ cd file-sharing && yarn vitest run src/tabs/ksmbd
 
 Voir [nfsv4.md](nfsv4.md) : ksmbd ne coordonne ni ses oplocks / baux ni ses modes de partage avec NFS ;
 sur un partage double protocole, `oplocks = no` et pas d'`acl_xattr`.
+
+## Dialectes SMB et performances
+
+L'onglet ksmbd propose une case par dialecte (`SMB2_10`, `SMB3_00`, `SMB3_02`, `SMB3_11`), ramenée à la plage contiguë
+`server min protocol` … `server max protocol` (`smb-dialects.ts`), et un groupe « Performances » (multicanal,
+`smbd max io size`, `smb2 max read/write/trans/credits`, signature, chiffrement, baux, poignées durables).
+Détails dans `docs/nfsv4.md`, section « Dialectes SMB ».

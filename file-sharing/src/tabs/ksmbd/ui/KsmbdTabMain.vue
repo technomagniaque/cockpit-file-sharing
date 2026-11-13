@@ -6,10 +6,12 @@ import { useUserSettings } from "@/common/user-settings";
 import KsmbdParamEditor from "./KsmbdParamEditor.vue";
 import KsmbdPermissionSimulator from "./KsmbdPermissionSimulator.vue";
 import SambaConversion from "./SambaConversion.vue";
+import SmbDialects from "./SmbDialects.vue";
 import { KsmbdManager, type KsmbdProbe } from "../ksmbd-manager";
 import { parseIni, serializeIni, findSection, type IniDocument } from "../ini";
 import type { UserDb } from "../permission-stack";
-import { NFSv4Manager } from "@/tabs/nfs/nfsv4-manager";
+import { NFSv4Manager, type NfsServerSnapshot } from "@/tabs/nfs/nfsv4-manager";
+import { configuredVersions, effectiveNfsConf } from "@/tabs/nfs/nfsv4";
 import type { NFSExport } from "@/tabs/nfs/data-types";
 import { analyzeDualProtocol, applyDualProtocolRecommendations, overlappingExports } from "@/common/dual-protocol";
 import { getValue } from "../ini";
@@ -20,6 +22,9 @@ const nfsManager = new NFSv4Manager();
 const nfsExports = ref<NFSExport[]>([]);
 const nfsExportErrors = ref<string[]>([]);
 const rootDefaultAcl = ref<Record<string, boolean>>({});
+const nfsSnap = ref<NfsServerSnapshot | null>(null);
+const resolvePath = (p: string) => nfsSnap.value?.resolved[p] ?? p;
+const nfsVers = computed(() => (nfsSnap.value ? configuredVersions(effectiveNfsConf(nfsSnap.value)) : null));
 
 const doc = ref<IniDocument>({ flavor: "ksmbd", sections: [{ name: "global", entries: [], flavor: "ksmbd" }] });
 const savedText = ref("");
@@ -74,9 +79,15 @@ async function loadNfs() {
     const r = await nfsManager.allExports(userSettings.value.nfs.confPath);
     nfsExports.value = r.exports;
     nfsExportErrors.value = r.errors;
+    const sharePaths = shares.value.map((sh) => getValue(sh, "path")).filter((p): p is string => !!p);
+    try {
+      nfsSnap.value = await nfsManager.snapshot([...new Set([...r.exports.map((e) => e.path), ...sharePaths])]);
+    } catch {
+      nfsSnap.value = null;
+    }
     for (const sh of shares.value) {
       const path = getValue(sh, "path");
-      if (path && overlappingExports(path, r.exports).length) {
+      if (path && overlappingExports(path, r.exports, resolvePath).length) {
         const pp = await manager.probePath(path);
         rootDefaultAcl.value = { ...rootDefaultAcl.value, [sh.name]: pp.hasDefaultAcl };
       }
@@ -90,10 +101,15 @@ const umaskStr = computed(() => (probe.value?.workerUmask != null ? probe.value.
 const dualForShare = computed(() => {
   if (!share.value) return [];
   const path = getValue(share.value, "path") ?? "";
-  return overlappingExports(path, nfsExports.value).map((o) => ({
+  return overlappingExports(path, nfsExports.value, resolvePath).map((o) => ({
     export: o.export,
     relation: o.relation,
-    findings: analyzeDualProtocol({ doc: doc.value, share: share.value!.name, nfsExport: o.export, db: db.value, rootHasDefaultAcl: rootDefaultAcl.value[share.value!.name], workerUmask: umaskStr.value }),
+    findings: analyzeDualProtocol({
+      doc: doc.value, share: share.value!.name, nfsExport: o.export, db: db.value,
+      rootHasDefaultAcl: rootDefaultAcl.value[share.value!.name], workerUmask: umaskStr.value,
+      leasesEnable: nfsSnap.value?.leasesEnable, resolve: resolvePath,
+      nfsV3: nfsVers.value?.v3 ?? true, nfsV4: nfsVers.value ? !!(nfsVers.value.v40 || nfsVers.value.v41 || nfsVers.value.v42) : true,
+    }),
   }));
 });
 function applyDual() {
@@ -226,6 +242,7 @@ const envIssues = computed(() => {
         </div>
         <textarea v-if="rawMode" v-model="rawText" rows="28" class="input-textlike w-full font-mono text-xs"></textarea>
         <template v-else>
+          <SmbDialects :doc="doc" class="mb-4" />
           <div class="text-header mb-2">[global]</div>
           <KsmbdParamEditor :section="global" scope="global" :netdevs="netdevs" />
           <div class="text-xs text-muted mt-2">
