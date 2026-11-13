@@ -5,10 +5,11 @@
  * le rapport et l'aperçu, puis écrit ksmbd.conf (avec sauvegarde).
  */
 import { computed, reactive, ref } from "vue";
+import type { NFSExport } from "@/tabs/nfs/data-types";
 import { convertSambaToKsmbd, mergeSambaSources, defaultConversionOptions, type ConversionResult, type ReportAction } from "../samba-to-ksmbd";
 import type { KsmbdManager, KsmbdProbe } from "../ksmbd-manager";
 
-const props = defineProps<{ manager: KsmbdManager; smbConfPath: string; probe: KsmbdProbe | null }>();
+const props = defineProps<{ manager: KsmbdManager; smbConfPath: string; probe: KsmbdProbe | null; nfsExports?: NFSExport[] }>();
 const emit = defineEmits<{ (e: "apply", text: string): void }>();
 
 const opts = reactive(defaultConversionOptions());
@@ -40,7 +41,7 @@ async function analyse() {
     }
     const doc = mergeSambaSources(sources.value.smbConf, sources.value.registry);
     if (!doc.sections.length) throw new Error("Aucune configuration Samba trouvée");
-    result.value = convertSambaToKsmbd(doc, opts);
+    result.value = convertSambaToKsmbd(doc, { ...opts, nfsExports: props.nfsExports ?? [] });
   } catch (e: any) {
     error.value = e?.message ?? String(e);
   } finally {

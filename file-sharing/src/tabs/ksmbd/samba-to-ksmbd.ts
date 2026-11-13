@@ -14,6 +14,8 @@
  */
 import { cloneDoc, deleteValue, findSection, getValue, parseIni, serializeIni, setValue, type IniDocument, type IniSection } from "./ini";
 import { findParam, normalizeKey } from "./ksmbd-params";
+import type { NFSExport } from "@/tabs/nfs/data-types";
+import { analyzeDualProtocol, overlappingExports } from "@/common/dual-protocol";
 
 export type ReportAction = "kept" | "renamed" | "converted" | "dropped" | "added" | "warning" | "skipped-section";
 
@@ -57,6 +59,8 @@ export interface ConversionOptions {
   intersectWithValidUsers: boolean;
   /** partages à exclure de la conversion */
   excludeShares: string[];
+  /** exports NFS existants : les partages au même chemin reçoivent les constats « double protocole » */
+  nfsExports?: NFSExport[];
 }
 
 export const defaultConversionOptions = (): ConversionOptions => ({
@@ -363,7 +367,7 @@ const SHARE_DROP: Record<string, string> = {
   dosfiletimes: "sans objet",
   mapreadonly: "non géré", maparchive: "non géré", maphidden: "non géré", mapsystem: "non géré",
   easupport: "les xattrs utilisateur sont toujours exposés",
-  strictlocking: "géré par le noyau", strictsync: "géré par le noyau", syncalways: "géré par le noyau", kerneloplocks: "sans objet", kernelsharemodes: "sans objet", posixlocking: "sans objet", level2oplocks: "intégré aux oplocks / baux",
+  strictlocking: "géré par le noyau", strictsync: "géré par le noyau", syncalways: "géré par le noyau", kerneloplocks: "pas d'équivalent : ksmbd ne pose aucun bail noyau, ses oplocks ne sont pas coordonnés avec NFS ou les accès locaux", kernelsharemodes: "pas d'équivalent : les modes de partage ksmbd sont internes (invisibles pour NFS et les accès locaux)", posixlocking: "toujours actif : ksmbd pose des verrous POSIX noyau", level2oplocks: "intégré aux oplocks / baux",
   cscpolicy: "pas de cache côté client configurable",
   guestonly: "non géré : utilisez force user = <compte invité> + guest ok",
   "shadow:snapdir": "pas de « Versions précédentes » (shadow_copy2) dans ksmbd",
@@ -721,6 +725,28 @@ export function convertSambaToKsmbd(sambaDoc: IniDocument, opts: ConversionOptio
     "# démarrage complet : les paramètres [global] ne sont lus qu'au démarrage de ksmbd.mountd (pas par --reload)",
     "systemctl enable ksmbd && systemctl restart ksmbd",
   );
+
+  // cohabitation avec des exports NFS existants
+  if (opts.nfsExports?.length) {
+    for (const sec of out.sections) {
+      if (sec.name.toLowerCase() === "global") continue;
+      const path = getValue(sec, "path") ?? "";
+      for (const { export: e } of overlappingExports(path, opts.nfsExports)) {
+        const src = findSection(sambaDoc, sec.name);
+        const ko = getValue(src, "kernel oplocks") ?? getValue(srcGlobal, "kernel oplocks");
+        const ksm = getValue(src, "kernel share modes") ?? getValue(srcGlobal, "kernel share modes");
+        add(report, {
+          section: sec.name, action: "warning",
+          note: `chemin exporté aussi en NFS (${e.path}). Samba${ko !== undefined ? ` (kernel oplocks = ${ko})` : ""}${ksm !== undefined ? ` (kernel share modes = ${ksm})` : ""} pouvait coordonner ses oplocks et modes de partage avec le noyau ; ksmbd n'a aucun équivalent.`,
+        });
+        for (const f of analyzeDualProtocol({ doc: out, share: sec.name, nfsExport: e })) {
+          if (f.level === "info") continue;
+          add(report, { section: sec.name, action: "warning", note: `NFS ${e.path} — ${f.title} : ${f.detail}${f.fix ? ` → ${f.fix}` : ""}` });
+          if (f.level === "danger") blocking.push(`[${sec.name}] ${f.title} (export NFS ${e.path}) : ${f.fix ?? f.detail}`);
+        }
+      }
+    }
+  }
 
   const text = serializeIni(out, [
     "ksmbd.conf généré par cockpit-file-sharing (conversion depuis Samba)",

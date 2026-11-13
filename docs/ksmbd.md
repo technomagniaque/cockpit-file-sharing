@@ -94,3 +94,8 @@ Le résultat est chargé dans l'éditeur ; l'écriture crée `ksmbd.conf.bak-<da
 ```bash
 cd file-sharing && yarn vitest run src/tabs/ksmbd
 ```
+
+## NFSv4.1 sur les mêmes chemins
+
+Voir [nfsv4.md](nfsv4.md) : ksmbd ne coordonne ni ses oplocks / baux ni ses modes de partage avec NFS ;
+sur un partage double protocole, `oplocks = no` et pas d'`acl_xattr`.

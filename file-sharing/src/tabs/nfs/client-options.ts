@@ -32,6 +32,11 @@ export const NFS_BOOL_OPTS = [
   "all_squash",
   "no_all_squash",
   "pinclient",
+  // NFSv4.x
+  "security_label",
+  "pnfs",
+  "no_pnfs",
+  "nordirplus",
 ];
 
 // All of these require a `key=value` form; bare usage is an error.
@@ -46,6 +51,8 @@ export const NFS_ARGUMENT_OPTS = [
   "sec",
   "protocols",
   "mountgids",
+  // transport chiffré (RPC-with-TLS) : xprtsec=none:tls:mtls
+  "xprtsec",
 ];
 
 // These take comma-separated value lists, e.g. protocols=2,3,4 — bare

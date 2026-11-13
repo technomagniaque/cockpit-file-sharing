@@ -9,9 +9,17 @@ import SambaConversion from "./SambaConversion.vue";
 import { KsmbdManager, type KsmbdProbe } from "../ksmbd-manager";
 import { parseIni, serializeIni, findSection, type IniDocument } from "../ini";
 import type { UserDb } from "../permission-stack";
+import { NFSv4Manager } from "@/tabs/nfs/nfsv4-manager";
+import type { NFSExport } from "@/tabs/nfs/data-types";
+import { analyzeDualProtocol, applyDualProtocolRecommendations, overlappingExports } from "@/common/dual-protocol";
+import { getValue } from "../ini";
 
 const userSettings = useUserSettings();
 const manager = new KsmbdManager();
+const nfsManager = new NFSv4Manager();
+const nfsExports = ref<NFSExport[]>([]);
+const nfsExportErrors = ref<string[]>([]);
+const rootDefaultAcl = ref<Record<string, boolean>>({});
 
 const doc = ref<IniDocument>({ flavor: "ksmbd", sections: [{ name: "global", entries: [], flavor: "ksmbd" }] });
 const savedText = ref("");
@@ -52,6 +60,7 @@ async function reload() {
     probe.value = p;
     db.value = users;
     loadText(text, true);
+    loadNfs();
   } catch (e: any) {
     pushNotification(new Notification("Lecture impossible", e?.message ?? String(e), "error"));
   } finally {
@@ -59,6 +68,41 @@ async function reload() {
   }
 }
 onMounted(reload);
+
+async function loadNfs() {
+  try {
+    const r = await nfsManager.allExports(userSettings.value.nfs.confPath);
+    nfsExports.value = r.exports;
+    nfsExportErrors.value = r.errors;
+    for (const sh of shares.value) {
+      const path = getValue(sh, "path");
+      if (path && overlappingExports(path, r.exports).length) {
+        const pp = await manager.probePath(path);
+        rootDefaultAcl.value = { ...rootDefaultAcl.value, [sh.name]: pp.hasDefaultAcl };
+      }
+    }
+  } catch {
+    nfsExports.value = [];
+  }
+}
+
+const umaskStr = computed(() => (probe.value?.workerUmask != null ? probe.value.workerUmask.toString(8).padStart(4, "0") : undefined));
+const dualForShare = computed(() => {
+  if (!share.value) return [];
+  const path = getValue(share.value, "path") ?? "";
+  return overlappingExports(path, nfsExports.value).map((o) => ({
+    export: o.export,
+    relation: o.relation,
+    findings: analyzeDualProtocol({ doc: doc.value, share: share.value!.name, nfsExport: o.export, db: db.value, rootHasDefaultAcl: rootDefaultAcl.value[share.value!.name], workerUmask: umaskStr.value }),
+  }));
+});
+function applyDual() {
+  if (!share.value) return;
+  const changes = applyDualProtocolRecommendations(doc.value, share.value.name);
+  doc.value = { ...doc.value };
+  pushNotification(new Notification("Réglages double protocole", changes.length ? changes.join("\n") + "\nNon enregistré : vérifiez puis enregistrez." : "Déjà appliqués.", "info", 8000));
+}
+const levelClass = (l: string) => ({ danger: "text-danger", warning: "text-warning", info: "text-muted" })[l] ?? "";
 
 function toggleRaw() {
   if (rawMode.value) loadText(rawText.value);
@@ -206,6 +250,27 @@ const envIssues = computed(() => {
             <button class="btn btn-danger text-xs" @click="removeShare(share.name)">Supprimer ce partage</button>
           </div>
           <KsmbdParamEditor :key="share.name" :section="share" scope="share" :inherited="global" />
+          <div v-if="dualForShare.length" class="mt-4 rounded-lg border border-default p-3 text-sm">
+            <div class="flex justify-between items-center">
+              <div class="text-header">Cohabitation NFS</div>
+              <button class="btn btn-secondary text-xs" @click="applyDual">Appliquer les réglages double protocole recommandés</button>
+            </div>
+            <div v-for="d in dualForShare" :key="d.export.path" class="mt-2">
+              <div class="text-label">
+                Export NFS <span class="font-mono">{{ d.export.path }}</span>
+                ({{ d.relation === "same" ? "même chemin" : d.relation === "nfs-parent" ? "l'export contient ce partage" : "ce partage contient l'export" }})
+              </div>
+              <div v-for="f in d.findings" :key="f.id" class="mt-1">
+                <span :class="levelClass(f.level)" class="font-medium">{{ f.title }}</span>
+                <div class="text-muted">{{ f.detail }}</div>
+                <div v-if="f.fix" class="text-xs">→ {{ f.fix }}</div>
+                <div v-if="f.ref" class="text-xs text-muted">Réf. : {{ f.ref }}</div>
+              </div>
+            </div>
+          </div>
+          <div v-if="nfsExportErrors.length" class="mt-2 text-xs text-warning">
+            Exports NFS illisibles ignorés : {{ nfsExportErrors.join(" ; ") }}
+          </div>
         </template>
         <div v-else class="text-muted text-sm">Aucun partage.</div>
       </CardContainer>
@@ -218,7 +283,7 @@ const envIssues = computed(() => {
 
     <CardContainer v-else>
       <template #header>Conversion Samba → ksmbd</template>
-      <SambaConversion :manager="manager" :smbConfPath="userSettings.samba.confPath" :probe="probe" @apply="fromConversion" />
+      <SambaConversion :manager="manager" :smbConfPath="userSettings.samba.confPath" :probe="probe" :nfsExports="nfsExports" @apply="fromConversion" />
     </CardContainer>
 
     <SystemdServiceCard name="Service ksmbd" serviceName="ksmbd.service" warnIfStopped />

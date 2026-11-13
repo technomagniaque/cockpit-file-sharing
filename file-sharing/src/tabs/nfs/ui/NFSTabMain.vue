@@ -17,6 +17,7 @@ import { NFSManager } from "@/tabs/nfs/nfs-manager";
 import type { NFSExport } from "@/tabs/nfs/data-types";
 
 import NFSExportListView from "@/tabs/nfs/ui/NFSExportListView.vue";
+import NFSv4Panel from "@/tabs/nfs/ui/NFSv4Panel.vue";
 
 import SystemdServiceCard from "@/common/ui/SystemdServiceCard.vue";
 import type { ShareDefinition } from "@/common/share-common";
@@ -218,6 +219,7 @@ watch(
         (nfsExport, callback) => actions.removeExport(nfsExport).map(() => callback?.())
       "
     />
+    <NFSv4Panel :nfsExports="nfsExports" />
     <CardContainer>
       <template #header>
         {{ _("Import/Export Config") }}
