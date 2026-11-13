@@ -82,9 +82,10 @@ export class KsmbdManager {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const backup = `${this.confPath}.bak-${stamp}`;
     await this.run('mkdir -p -- "$(dirname -- "$1")" && { [ ! -f "$1" ] || cp -a -- "$1" "$2"; }', [this.confPath, backup]);
+    const content = text.endsWith("\n") ? text : text + "\n";
     const file = new File(this.server, this.confPath);
-    await unwrap(file.exists({ superuser: "try" }).andThen((exists) => (exists ? file.replace(text, { superuser: "try" }) : file.create(true, { superuser: "try" }).andThen((f) => f.replace(text, { superuser: "try" })))));
-    const reload = await this.run('if pgrep -x ksmbd.mountd >/dev/null; then ksmbd.control --reload; else echo "ksmbd.mountd arrêté : rien à recharger"; fi');
+    await unwrap(file.exists({ superuser: "try" }).andThen((exists) => (exists ? file.replace(content, { superuser: "try" }) : file.create(true, { superuser: "try" }).andThen((f) => f.replace(content, { superuser: "try" })))));
+    const reload = await this.run('export PATH="$PATH:/usr/sbin:/sbin"; if pgrep -x ksmbd.mountd >/dev/null; then ksmbd.control --reload; else echo "ksmbd.mountd arrêté : rien à recharger"; fi');
     return { backup, reload, needsRestart };
   }
 
@@ -120,12 +121,17 @@ export class KsmbdManager {
 
   async probe(): Promise<KsmbdProbe> {
     const r = await this.run(String.raw`
+export PATH="$PATH:/usr/sbin:/sbin"
 k=$(uname -r)
 echo "kernel=$k"
 cfg=/boot/config-$k; [ -f "$cfg" ] || cfg=/proc/config.gz
 get() { if [ "$cfg" = /proc/config.gz ]; then zgrep -E "^$1=" "$cfg" 2>/dev/null; else grep -E "^$1=" "$cfg" 2>/dev/null; fi | cut -d= -f2; }
-echo "smbserver=$(get CONFIG_SMB_SERVER)"
-echo "smbdirect=$(get CONFIG_SMB_SERVER_SMBDIRECT)"
+smbsrv=$(get CONFIG_SMB_SERVER)
+if [ -z "$smbsrv" ] && { [ -d /sys/module/ksmbd ] || modinfo ksmbd >/dev/null 2>&1; }; then smbsrv=m; fi
+echo "smbserver=$smbsrv"
+smbdir=$(get CONFIG_SMB_SERVER_SMBDIRECT)
+if [ -z "$smbdir" ] && { grep -q ksmbd_rdma /proc/kallsyms 2>/dev/null || modinfo -F depends ksmbd 2>/dev/null | grep -Eq 'ib_core|rdma_cm'; }; then smbdir=y; fi
+echo "smbdirect=$smbdir"
 modinfo ksmbd >/dev/null 2>&1 && echo "modavail=1" || echo "modavail=0"
 [ -d /sys/module/ksmbd ] && echo "modloaded=1" || echo "modloaded=0"
 command -v ksmbd.mountd >/dev/null && echo "tools=1" || echo "tools=0"
@@ -137,6 +143,17 @@ echo "zfs=$(zfs version 2>/dev/null | head -1)"
 kt=$(pgrep -x kthreadd 2>/dev/null | head -1); [ -n "$kt" ] || kt=2
 echo "umask=$(awk '/^Umask:/{print $2}' /proc/$kt/status 2>/dev/null)"
 command -v rdma >/dev/null && rdma -j link show 2>/dev/null | sed 's/^/rdma=/'
+for d in /sys/class/infiniband/*; do
+  [ -d "$d" ] || continue
+  dev=$(basename "$d")
+  nd=""; for n in "$d"/device/net/*; do [ -e "$n" ] && { nd=$(basename "$n"); break; }; done
+  for p in "$d"/ports/*; do
+    [ -d "$p" ] || continue
+    pn=$(basename "$p")
+    st=$(sed 's/^[0-9]*:[[:space:]]*//' "$p/state" 2>/dev/null)
+    echo "rdmasys=$dev|$pn|$st|$nd"
+  done
+done
 for n in /sys/class/net/*; do b=$(basename "$n"); [ "$b" = lo ] && continue
   drv=$(basename "$(readlink -f "$n/device/driver" 2>/dev/null)" 2>/dev/null)
   echo "net=$b|$(cat "$n/operstate" 2>/dev/null)|$drv|$(cat "$n/speed" 2>/dev/null)"
@@ -144,6 +161,7 @@ done
 `, [this.confPath]);
     const kv: Record<string, string> = {};
     const nets: KsmbdProbe["netdevs"] = [];
+    const sysLinks: KsmbdProbe["rdmaLinks"] = [];
     let rdmaJson = "";
     for (const line of r.out.split("\n")) {
       const i = line.indexOf("=");
@@ -153,6 +171,9 @@ done
       if (k === "net") {
         const [name, state, driver, speed] = v.split("|");
         nets.push({ name: name!, state: state ?? "", driver: driver ?? "", speed: speed && Number(speed) > 0 ? `${speed} Mb/s` : "" });
+      } else if (k === "rdmasys") {
+        const [dev, port, state, netdev] = v.split("|");
+        if (dev && port) sysLinks.push({ dev, port, state: (state ?? "").trim(), netdev: (netdev ?? "").trim() });
       } else if (k === "rdma") rdmaJson += v;
       else kv[k] = v;
     }
@@ -160,6 +181,7 @@ done
     try {
       rdmaLinks = (JSON.parse(rdmaJson || "[]") as any[]).map((l) => ({ dev: l.ifname, port: String(l.port), state: l.state, netdev: l.netdev ?? "" }));
     } catch { rdmaLinks = []; }
+    if (!rdmaLinks.length && sysLinks.length) rdmaLinks = sysLinks;
     const m = /^(\d+)\.(\d+)/.exec(kv.kernel ?? "");
     const major = m ? Number(m[1]) : 0;
     const minor = m ? Number(m[2]) : 0;

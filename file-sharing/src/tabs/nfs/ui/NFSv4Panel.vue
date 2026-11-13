@@ -214,7 +214,7 @@ const yes = (b: boolean | undefined) => (b === undefined ? "?" : b ? "oui" : "no
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 mt-2">
           <div v-for="f in perfFields" :key="f.section + f.key">
             <label class="block"><span class="font-mono">[{{ f.section }}] {{ f.key }}</span></label>
-            <select v-if="f.type === 'bool'" class="input-textlike w-full" :value="fieldValue(f)" @change="f.key === 'rdma' ? toggleRdma(($event.target as HTMLSelectElement).value === 'y') : setField(f, ($event.target as HTMLSelectElement).value)">
+            <select v-if="f.type === 'bool'" class="input-textlike w-full" :value="fieldValue(f)" @change="f.key === 'rdma' && ($event.target as HTMLSelectElement).value !== '' ? toggleRdma(($event.target as HTMLSelectElement).value === 'y') : setField(f, ($event.target as HTMLSelectElement).value)">
               <option value="">défaut ({{ f.default }})</option>
               <option value="y">y</option>
               <option value="n">n</option>
@@ -238,7 +238,7 @@ const yes = (b: boolean | undefined) => (b === undefined ? "?" : b ? "oui" : "no
         <div class="button-group-row mt-2">
           <button class="btn btn-secondary" @click="toggleRdma(!rdmaOn)">{{ rdmaOn ? "Désactiver" : "Activer" }} NFS/RDMA (port 20049)</button>
         </div>
-        <p class="text-xs text-muted mt-1">RDMA sert NFSv3 et NFSv4.x ; mountd, statd et lockd restent en TCP / UDP. ksmbd SMB Direct écoute sur 5445 (iWARP) / 445 (RoCE) : pas de conflit.</p>
+        <p class="text-xs text-muted mt-1">RDMA sert NFSv3 et NFSv4.x ; mountd, statd et lockd restent en TCP / UDP. ksmbd SMB Direct écoute sur 5445 en Linux 6.12 et en iWARP (ou 445 en RoCE/IB seul sur noyaux récents) : pas de conflit.</p>
       </div>
 
       <div v-if="snap && snap.leasesEnable !== false && ksmbdDoc" class="rounded-lg border border-default p-3 text-warning">

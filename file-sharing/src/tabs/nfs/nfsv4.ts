@@ -37,7 +37,9 @@
  *    __write_ports_addxprt) ; côté client, proto=rdma prend le port 20049 par
  *    défaut (fs/nfs/fs_context.c NFS_RDMA_PORT) et nconnect reste accepté avec
  *    RDMA (fs/nfs/nfs4client.c).
- *  - ksmbd SMB Direct écoute en RDMA sur 445 (IB / RoCE) et 5445 (iWARP)
+ *  - ksmbd SMB Direct écoute en RDMA sur 5445 en Linux 6.12 (SMB_DIRECT_PORT,
+ *    iWARP comme RoCE / IB) et, sur les noyaux plus récents, sur un unique port
+ *    (445 en IB / RoCE seul, 5445 dès qu'un adaptateur iWARP est présent)
  *    (fs/smb/server/transport_rdma.c) : aucun conflit avec NFS/RDMA 20049.
  */
 import type { NFSExport } from "./data-types";
@@ -101,7 +103,9 @@ function scan(text: string): NfsConfLine[] {
     }
     const kv = /^([#;]\s*)?([A-Za-z0-9._-]+)\s*=\s*(.*?)\s*$/.exec(t);
     if (kv && section) {
-      return { raw, section, key: kv[2]!.toLowerCase(), value: kv[3]!.replace(/\s+#.*$/, ""), commented: !!kv[1] };
+      let val = kv[3]!.replace(/\s*[#;].*$/, "").trim();
+      if (/^".*"$/.test(kv[3]!)) val = kv[3]!.slice(1, -1);
+      return { raw, section, key: kv[2]!.toLowerCase(), value: val, commented: !!kv[1] };
     }
     return { raw, section };
   });
@@ -149,11 +153,11 @@ export function setNfsConf(text: string, section: string, key: string, value: st
     const sep = out.length && out[out.length - 1]!.trim() !== "" ? [""] : [];
     return [...out, ...sep, `[${section}]`, line, ""].join("\n");
   }
-  // fin de la section : dernière ligne appartenant à la section
+  // fin de la section : dernière ligne clé-valeur appartenant à la section (sans déborder sur les commentaires de la section suivante)
   let end = secIdx;
   for (let i = secIdx + 1; i < lines.length; i++) {
     if (lines[i]!.section !== sec) break;
-    if (lines[i]!.raw.trim() !== "") end = i;
+    if (lines[i]!.key) end = i;
   }
   out.splice(end + 1, 0, line);
   return out.join("\n");
@@ -191,10 +195,10 @@ export function applyRdma(text: string, on: boolean, port = "20049"): string {
 export type NfsVersionKey = "v3" | "v40" | "v41" | "v42";
 
 export const NFS_VERSION_INFO: { key: NfsVersionKey; conf: string; label: string; brings: string; clients: string }[] = [
-  { key: "v3", conf: "vers3", label: "NFSv3", brings: "Sans état côté serveur, ACL POSIX natives (NFSACL), verrous NLM ; exige rpcbind, mountd, statd, lockd.", clients: "ESXi (NFS 3), vieux Unix, appliances, VMware sans 4.1, outils de sauvegarde." },
-  { key: "v40", conf: "vers4.0", label: "NFSv4.0", brings: "Un seul port (2049), délégations, idmapping ; pas de sessions.", clients: "Clients anciens (Linux < 2.6.38, certains BSD / Solaris)." },
-  { key: "v41", conf: "vers4.1", label: "NFSv4.1", brings: "Sessions et reprise « exactly once », trunking de session (multi-chemin), pNFS.", clients: "ESXi 6.5+ (NFS 4.1), Windows Server NFS client, macOS (4.0/4.1 selon version), Linux." },
-  { key: "v42", conf: "vers4.2", label: "NFSv4.2", brings: "Copie côté serveur, fichiers épars (SEEK_HOLE, ALLOCATE), xattrs utilisateur (RFC 8276), étiquettes SELinux.", clients: "Linux récents uniquement." },
+  { key: "v3", conf: "vers3", label: "NFSv3", brings: "Sans état côté serveur, ACL POSIX natives (NFSACL), verrous NLM ; exige rpcbind, mountd, statd, lockd.", clients: "ESXi (NFS 3), Proxmox VE (v3 par défaut), macOS (mount_nfs par défaut en v3), FreeBSD / BSD, appliances, sauvegardes." },
+  { key: "v40", conf: "vers4.0", label: "NFSv4.0", brings: "Un seul port (2049), délégations, idmapping ; pas de sessions.", clients: "Clients anciens (Linux < 2.6.38, macOS avec -o vers=4 sans mineure, anciens BSD / Solaris)." },
+  { key: "v41", conf: "vers4.1", label: "NFSv4.1", brings: "Sessions et reprise « exactly once », trunking de session (multi-chemin), pNFS.", clients: "Linux (≥ 2.6.38), Proxmox VE (vers=4.1), ESXi 6.0+ (NFS 4.1), Windows (client NFSv4.1 natif), macOS (mount_nfs -o vers=4.1, 10.15+ / Sequoia 15), FreeBSD." },
+  { key: "v42", conf: "vers4.2", label: "NFSv4.2", brings: "Copie côté serveur, fichiers épars (SEEK_HOLE, ALLOCATE), xattrs utilisateur (RFC 8276), étiquettes SELinux.", clients: "Linux (≥ 4.2, défaut de mount.nfs récent), FreeBSD 13+ (minorversion=2). Non supporté par ESXi, macOS ni Windows." },
 ];
 
 /**
@@ -485,8 +489,8 @@ export function analyzeRdma(state: ServerState): Finding[] {
   if (state.portlist !== undefined && !listeners.length) f.push({ level: "warning", title: "nfsd n'écoute pas en RDMA", detail: `rdma=y dans nfs.conf mais /proc/fs/nfsd/portlist ne contient pas de ligne « rdma » (${parsePortlist(state.portlist).map((l) => l.transport + " " + l.port).join(", ") || "vide"}).`, fix: "systemctl restart nfs-server (après modprobe rpcrdma) ; ou à chaud : echo 'rdma 20049' > /proc/fs/nfsd/portlist", ref: "fs/nfsd/nfsctl.c __write_ports_addxprt" });
   else if (listeners.length) f.push({ level: "info", title: "NFS/RDMA à l'écoute", detail: listeners.map((l) => `${l.transport} ${l.port}`).join(", ") + ". Valable pour NFSv3 et NFSv4.1 ; mountd, statd et lockd (v3) restent en TCP / UDP." });
   const types = Object.values(state.rdmaNodeTypes ?? {});
-  if (types.includes("iwarp")) f.push({ level: "info", title: "iWARP", detail: "En iWARP, l'espace de ports RDMA est celui de TCP : 20049/tcp doit être libre et autorisé (ksmbd SMB Direct utilise 5445 en iWARP : pas de conflit)." });
-  if (types.includes("ib-roce")) f.push({ level: "info", title: "RoCE / InfiniBand", detail: "En RoCEv2 le trafic passe par 4791/udp (traité par la carte) ; ksmbd SMB Direct y écoute sur 445 dans l'espace de ports RDMA, sans conflit avec 20049. RoCE exige un réseau sans perte (PFC / ECN) sur le switch." });
+  if (types.includes("iwarp")) f.push({ level: "info", title: "iWARP", detail: "En iWARP, l'espace de ports RDMA est celui de TCP : 20049/tcp doit être libre et autorisé (ksmbd SMB Direct utilise 5445 en iWARP et en 6.12 : pas de conflit)." });
+  if (types.includes("ib-roce")) f.push({ level: "info", title: "RoCE / InfiniBand", detail: "En RoCEv2 le trafic passe par 4791/udp (traité par la carte) ; ksmbd SMB Direct écoute dans l'espace de ports RDMA sur 5445 en Linux 6.12 (et sur les noyaux plus récents : 445 en IB/RoCE seul, ou 5445 dès qu'un adaptateur iWARP est présent), sans conflit avec 20049. RoCE exige un réseau sans perte (PFC / ECN) sur le switch." });
   f.push({ level: "info", title: "Montage côté client", detail: "Linux : mount -t nfs -o vers=4.1,proto=rdma serveur:/chemin /mnt (port 20049 par défaut avec proto=rdma) ; NFSv3 : -o vers=3,proto=rdma. nconnect reste accepté avec RDMA (plusieurs connexions RDMA).", ref: "fs/nfs/fs_context.c NFS_RDMA_PORT ; fs/nfs/nfs4client.c nconnect" });
   return f;
 }
@@ -590,7 +594,7 @@ export function exportLineFor(e: NFSExport, path: string, fsid: string): string 
     return o.length ? `${c.host}(${o.join(",")})` : c.host;
   });
   const p = /\s/.test(path) ? `"${path}"` : path;
-  return [p, `-${def.join(",")}`, ...(clients.length ? [clients.join(" ")] : [])].join(" ");
+  return [p, `-${def.join(",")}`, ...(clients.length ? [clients.join(" ")] : ["*"])].join(" ");
 }
 
 /**
@@ -602,10 +606,17 @@ export function analyzeExportV3(e: NFSExport, children: ZfsChild[], exportedPath
   const findings: Finding[] = [];
   const suggestedLines: string[] = [];
   const root = normDir(e.path);
-  const exported = new Set(exportedPaths.map(normDir));
+  const exported = new Set(exportedPaths.filter((p) => p && p.startsWith("/")).map(normDir));
+  const seen = new Set<string>();
   const under = children
+    .filter((c) => c.mountpoint && c.mountpoint.startsWith("/"))
     .map((c) => ({ ...c, mountpoint: normDir(c.mountpoint) }))
-    .filter((c) => c.mountpoint !== root && c.mountpoint.startsWith(root === "/" ? "/" : root + "/"));
+    .filter((c) => {
+      if (c.mountpoint === root || !c.mountpoint.startsWith(root === "/" ? "/" : root + "/")) return false;
+      if (seen.has(c.mountpoint)) return false;
+      seen.add(c.mountpoint);
+      return true;
+    });
   const missing = under.filter((c) => !exported.has(c.mountpoint));
   if (missing.length) {
     findings.push({

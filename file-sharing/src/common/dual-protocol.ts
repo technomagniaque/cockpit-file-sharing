@@ -10,6 +10,15 @@
  *    SMB → incohérence de données possible. « oplocks = no » sur le partage
  *    empêche l'octroi des oplocks ET des baux : smb2pdu.c smb2_open teste
  *    KSMBD_SHARE_FLAG_OPLOCKS et n'appelle alors pas smb_grant_oplock.
+ *  - Poignées durables (« durable handles = yes » dans [global]) : dans
+ *    smb2_open, parse_durable_handle_context s'exécute AVANT le test de
+ *    KSMBD_SHARE_FLAG_OPLOCKS et ne regarde que la requête du client
+ *    (SMB2_OPLOCK_LEVEL_BATCH ou bail avec SMB2_LEASE_HANDLE_CACHING_LE), puis
+ *    smb2_open pose fp->is_durable = 1 même sans smb_grant_oplock (opinfo ==
+ *    NULL). À la reconnexion, smb2_check_durable_oplock renvoie 0 dès que
+ *    opinfo_get(fp) == NULL : oplocks = no n'empêche donc ni l'octroi ni la
+ *    reconnexion d'une poignée durable, qui garde le fichier ouvert 60 à 300 s
+ *    après coupure (modes de partage et verrous POSIX compris).
  *  - Délégations NFSv4 : ce sont des baux noyau (fs/nfsd/nfs4state.c,
  *    kernel_setlease). ksmbd ouvre avec O_NONBLOCK (smb2pdu.c smb2_open :
  *    « oflags = O_NONBLOCK | O_LARGEFILE ») : __break_lease lance le rappel
@@ -167,7 +176,14 @@ export function analyzeDualProtocol(ctx: DualContext): DualFinding[] {
     out.push({ id: "oplocks", level: "info", title: "oplocks = no : cache client SMB désactivé", detail: "Chaque lecture / écriture SMB va au serveur : cohérent avec NFS, au prix de performances plus faibles pour les petits fichiers." });
   }
   if (ksmbdBool(globalValue(ctx.doc, "durable handles"))) {
-    out.push({ id: "durable", level: "info", title: "Poignées durables actives", detail: "Accordées selon la demande du client, indépendamment de oplocks = no : après une coupure, une poignée orpheline garde le fichier ouvert au moins 60 s (modes de partage et verrous compris), ce qui peut bloquer un client NFS ou SMB.", ref: "fs/smb/server/smb2pdu.c smb2_open (is_durable)" });
+    out.push({
+      id: "durable",
+      level: "warning",
+      title: "Poignées durables actives",
+      detail: "Accordées selon la demande du client, indépendamment de oplocks = no (parse_durable_handle_context s'exécute avant le test d'oplocks et smb2_check_durable_oplock accepte la reconnexion quand opinfo == NULL) : après une coupure, une poignée orpheline garde le fichier ouvert au moins 60 s (jusqu'à 300 s, modes de partage et verrous POSIX compris), ce qui peut bloquer un client NFS ou SMB.",
+      fix: "durable handles = no dans [global] (ou retirer la clé, désactivée par défaut).",
+      ref: "fs/smb/server/smb2pdu.c smb2_open, parse_durable_handle_context ; oplock.c smb2_check_durable_oplock",
+    });
   }
   out.push({ id: "attrcache", level: "info", title: "Caches d'attributs non couverts", detail: "oplocks = no ne couvre ni le cache d'attributs NFS (actimeo, cohérence garantie seulement fermeture → ouverture) ni le cache de métadonnées du client Windows (~10 s) : un changement fait d'un côté peut mettre quelques secondes à apparaître de l'autre. Le change attribute NFSv4 sur ZFS repose sur ctime (granularité possiblement grossière en 6.12, non vérifié)." });
 
@@ -327,6 +343,9 @@ export function applyDualProtocolRecommendations(doc: IniDocument, share: string
   if (ksmbdBool(effectiveShare(doc, share)["time machine"]?.value)) {
     setValue(sec, "time machine", "no");
     changes.push(ksmbdBool(getValue(findSection(doc, "global"), "time machine")) ? "time machine = no (surcharge la valeur héritée de [global])" : "time machine = no");
+  }
+  if (ksmbdBool(globalValue(doc, "durable handles"))) {
+    changes.push("ATTENTION : [global] définit durable handles = yes (accordé même avec oplocks = no) : passez-le à no dans [global] si aucun partage n'en a besoin");
   }
   changes.push(`Hors plugin (à confirmer) : fs.leases-enable=0 — ${LEASES_SYSCTL.commands.join(" ; ")}`);
   return changes;

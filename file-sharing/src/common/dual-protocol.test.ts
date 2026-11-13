@@ -71,8 +71,12 @@ suite("constats double protocole", () => {
     const d = parseIni("[global]\n\tdurable handles = yes\n[s]\n\tpath = /tank/s\n\toplocks = no\n", "ksmbd");
     const f = analyzeDualProtocol({ doc: d, share: "s", nfsExport: exp("/tank/s", "") });
     const byId = Object.fromEntries(f.map((x) => [x.id, x]));
+    expect(byId.durable!.level).toBe("warning");
     expect(byId.durable!.detail).toContain("60 s");
+    expect(byId.durable!.detail).toContain("parse_durable_handle_context");
     expect(byId.oplocks!.detail).not.toContain("durables");
+    const ch = applyDualProtocolRecommendations(d, "s");
+    expect(ch.some((c) => c.includes("durable handles = yes"))).toBe(true);
   });
   test("C14 : chemins comparés après résolution", () => {
     const d = parseIni("[s]\n\tpath = /srv/lien\n", "ksmbd");

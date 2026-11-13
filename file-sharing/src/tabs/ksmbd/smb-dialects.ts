@@ -36,7 +36,7 @@ export const SMB_DIALECTS: DialectInfo[] = [
   { id: "SMB2_10", label: "SMB 2.1", brings: "Baux (leases) de fichiers, MTU étendu. Pas de chiffrement, pas de multicanal.", clients: "Windows 7 / Server 2008 R2, vieux NAS, imprimantes et scanners « scan to folder », Android anciens, certaines TV." },
   { id: "SMB3_00", label: "SMB 3.0", brings: "Multicanal, SMB Direct (RDMA), chiffrement AES-CCM, signature AES-CMAC. Pas de poignées persistantes annoncées en 3.0 par ksmbd.", clients: "Windows 8 / Server 2012." },
   { id: "SMB3_02", label: "SMB 3.0.2", brings: "Améliorations RDMA (invalidation à distance). Noyau 6.12 : poignées persistantes annoncées seulement avec « durable handles = yes » (absentes des noyaux récents).", clients: "Windows 8.1 / Server 2012 R2." },
-  { id: "SMB3_11", label: "SMB 3.1.1", brings: "Intégrité de pré-authentification (protection contre la rétrogradation), chiffrement AES-GCM (plus rapide). Signature : HMAC-SHA256 / AES-CMAC seulement (pas d'AES-GMAC dans ksmbd). Compression : absente en 6.12 (UEK8), seulement noyaux 7.x. Noyau 6.12 : poignées persistantes avec « durable handles = yes ».", clients: "Windows 10 / 11 / Server 2016+, macOS récents, Linux cifs, smbclient." },
+  { id: "SMB3_11", label: "SMB 3.1.1", brings: "Intégrité de pré-authentification (protection contre la rétrogradation), chiffrement AES-GCM (plus rapide). Signature : HMAC-SHA256 / AES-CMAC seulement (pas d'AES-GMAC dans ksmbd). Compression : absente en 6.12 LTS (Debian 13 Trixie), seulement noyaux 7.x. Noyau 6.12 : poignées persistantes avec « durable handles = yes ».", clients: "Windows 10 / 11 / Server 2016+, macOS récents, Linux cifs, smbclient." },
 ];
 
 const ORDER: SmbDialect[] = SMB_DIALECTS.map((d) => d.id);

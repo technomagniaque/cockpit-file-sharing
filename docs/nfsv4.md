@@ -5,7 +5,7 @@ Code : `file-sharing/src/tabs/nfs/nfsv4.ts` (analyse et édition de nfs.conf, mo
 (volet de l'onglet NFS), `file-sharing/src/common/dual-protocol.ts` (constats SMB + NFS),
 `file-sharing/src/tabs/ksmbd/smb-dialects.ts` (dialectes SMB).
 
-Références noyau : arbre Linux 7.4-rc consulté localement, comparé à **v6.12** (base d'UEK8) sur les
+Références noyau : arbre Linux 7.4-rc consulté localement, comparé à **v6.12 LTS** (noyau de **Debian 13 Trixie**) sur les
 points cités ; aucune différence de comportement trouvée sauf mention. Les clés et défauts de
 `nfs.conf(5)` et `exports(5)` sont cités de mémoire (le dépôt nfs-utils n'était pas accessible).
 
@@ -108,7 +108,7 @@ Kerberos passe par `gssproxy.service` et `/etc/gssproxy/24-nfs-server.conf`.
   `-o vers=3,proto=rdma,port=20049`. Le port 20049 est déjà le défaut avec `proto=rdma`
   (`fs/nfs/fs_context.c` `NFS_RDMA_PORT`). `nconnect` **reste accepté** avec RDMA (`fs/nfs/nfs4client.c`,
   identique en 6.12) ; `READ_PLUS` est désactivé sur RDMA (`fs/nfs/client.c`).
-- **Cohabitation avec ksmbd SMB Direct** : ksmbd écoute en RDMA sur 445 (IB / RoCE) et 5445 (iWARP)
+- **Cohabitation avec ksmbd SMB Direct** : ksmbd écoute en RDMA sur 5445 en Linux 6.12 (`SMB_DIRECT_PORT = 5445`, iWARP comme RoCE / IB) et, sur les noyaux plus récents, sur un unique port (445 en IB / RoCE seul, 5445 dès qu'un adaptateur iWARP est présent)
   (`fs/smb/server/transport_rdma.c`) : aucun conflit avec 20049, mêmes interfaces RDMA possibles.
 
 ## Options d'export contrôlées
@@ -147,7 +147,7 @@ dans le volet NFS pour chaque export qui recoupe un partage (chemins comparés *
 | Verrous de plage | ksmbd pose des verrous POSIX (`smb2_lock` → `vfs_lock_file`), comme NLM en v3 (`fs/lockd/svclock.c`). Un verrou **même partagé** posé par NFS ou un processus local bloque toute écriture SMB sur la plage (`check_lock_range` : échec immédiat `STATUS_FILE_LOCK_CONFLICT`, un `pr_err` par E/S refusée, qui peut inonder dmesg). Les E/S NFS ignorent les verrous. La période de grâce NLM / nfsd n'est pas respectée par ksmbd | — |
 | Modes de partage | Internes à ksmbd et à nfsd ; aucune exclusion croisée | Éviter l'édition simultanée d'un même fichier |
 | `acl_xattr` | DACL vérifiée par ksmbd seulement | Retirer `acl_xattr`, effacer `security.NTACL` |
-| Poignées durables | Accordées selon la demande du client, **indépendamment** de `oplocks = no` ; une poignée orpheline garde le fichier ouvert au moins 60 s | Signalé si `durable handles = yes` |
+| Poignées durables | Accordées selon la demande du client, **indépendamment** de `oplocks = no` (`parse_durable_handle_context` s'exécute avant le test d'oplocks et `smb2_check_durable_oplock` accepte la reconnexion quand `opinfo == NULL`) ; une poignée orpheline garde le fichier ouvert 60 à 300 s | `durable handles = no` dans `[global]` (signalé en avertissement si `yes`) |
 | Caches d'attributs | Ni le cache d'attributs NFS (`actimeo`, cohérence fermeture → ouverture) ni le cache de métadonnées Windows (~10 s) ne sont couverts par `oplocks = no`. Change attribute NFSv4 sur ZFS = ctime (granularité grossière possible en 6.12, non vérifié) | Information |
 | `streams_xattr`, `user.DOSATTRIB` | Invisibles en v3 et v4.1 (xattrs seulement en 4.2) | — |
 | `force user` / `force group` | Propriétaires divergents | `all_squash,anonuid=…,anongid=…` ou ACL par défaut |

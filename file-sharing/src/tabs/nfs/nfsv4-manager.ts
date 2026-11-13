@@ -57,23 +57,35 @@ export class NFSv4Manager {
 
   async snapshot(exportPaths: string[] = []): Promise<NfsServerSnapshot> {
     const r = await run(this.server, String.raw`
+export PATH="$PATH:/usr/sbin:/sbin"
 conf="$1"; shift
-echo "@@conf"; [ -f "$conf" ] && cat -- "$conf"
-for f in /etc/nfs.conf.d/*.conf; do [ -f "$f" ] || continue; echo "@@confd $f"; cat -- "$f"; done
-echo "@@versions"; cat /proc/fs/nfsd/versions 2>/dev/null
-echo "@@portlist"; cat /proc/fs/nfsd/portlist 2>/dev/null
-echo "@@threads"; cat /proc/fs/nfsd/threads 2>/dev/null
-echo "@@leases"; cat /proc/sys/fs/leases-enable 2>/dev/null
+echo "@@conf"; [ -f "$conf" ] && awk '1' -- "$conf"
+for f in /etc/nfs.conf.d/*.conf; do [ -f "$f" ] || continue; echo "@@confd $f"; awk '1' -- "$f"; done
+echo "@@versions"; cat /proc/fs/nfsd/versions 2>/dev/null; echo
+echo "@@portlist"; cat /proc/fs/nfsd/portlist 2>/dev/null; echo
+echo "@@threads"; cat /proc/fs/nfsd/threads 2>/dev/null; echo
+echo "@@leases"; cat /proc/sys/fs/leases-enable 2>/dev/null; echo
 echo "@@rpcrdma"; [ -d /sys/module/rpcrdma ] && echo 1 || echo 0
-echo "@@xprtrdma"; k=$(uname -r); { grep -E '^CONFIG_SUNRPC_XPRT_RDMA=' "/boot/config-$k" 2>/dev/null || zgrep -E '^CONFIG_SUNRPC_XPRT_RDMA=' /proc/config.gz 2>/dev/null; } | cut -d= -f2
-echo "@@rdma"; command -v rdma >/dev/null && rdma -j link show 2>/dev/null
+echo "@@xprtrdma"; k=$(uname -r); xr=$({ grep -E '^CONFIG_SUNRPC_XPRT_RDMA=' "/boot/config-$k" 2>/dev/null || zgrep -E '^CONFIG_SUNRPC_XPRT_RDMA=' /proc/config.gz 2>/dev/null; } | cut -d= -f2); if [ -z "$xr" ] && { [ -d /sys/module/rpcrdma ] || modinfo rpcrdma >/dev/null 2>&1; }; then xr=m; fi; echo "$xr"
+echo "@@rdma"; command -v rdma >/dev/null && rdma -j link show 2>/dev/null; echo
+echo "@@rdmasys"; for d in /sys/class/infiniband/*; do
+  [ -d "$d" ] || continue
+  dev=$(basename "$d")
+  nd=""; for n in "$d"/device/net/*; do [ -e "$n" ] && { nd=$(basename "$n"); break; }; done
+  for p in "$d"/ports/*; do
+    [ -d "$p" ] || continue
+    pn=$(basename "$p")
+    st=$(sed 's/^[0-9]*:[[:space:]]*//' "$p/state" 2>/dev/null)
+    printf '%s\t%s\t%s\t%s\n' "$dev" "$pn" "$st" "$nd"
+  done
+done
 echo "@@nodetypes"; for d in /sys/class/infiniband/*; do [ -e "$d/node_type" ] && printf '%s\t%s\n' "$(basename "$d")" "$(cat "$d/node_type")"; done
 echo "@@services"; for u in rpcbind.socket nfs-mountd.service rpc-statd.service nfs-server.service; do printf '%s\t%s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null)"; done
 echo "@@idmap"; [ -f /etc/idmapd.conf ] && sed -n 's/^[[:space:]]*Domain[[:space:]]*=[[:space:]]*//Ip' /etc/idmapd.conf | head -1
 echo "@@dns"; dnsdomainname 2>/dev/null || hostname -d 2>/dev/null
 echo "@@host"; hostname -f 2>/dev/null || hostname
-echo "@@disable"; cat /sys/module/nfsd/parameters/nfs4_disable_idmapping 2>/dev/null
-echo "@@zfs"; [ -f /etc/exports.d/zfs.exports ] && cat /etc/exports.d/zfs.exports
+echo "@@disable"; cat /sys/module/nfsd/parameters/nfs4_disable_idmapping 2>/dev/null; echo
+echo "@@zfs"; [ -f /etc/exports.d/zfs.exports ] && awk '1' /etc/exports.d/zfs.exports
 echo "@@fstypes"; for p in "$@"; do printf '%s\t%s\t%s\n' "$p" "$(findmnt -no FSTYPE -T "$p" 2>/dev/null)" "$(readlink -f -- "$p" 2>/dev/null)"; done
 echo "@@children"; for p in "$@"; do
   [ "$(findmnt -no FSTYPE -T "$p" 2>/dev/null)" = zfs ] || continue
@@ -111,6 +123,12 @@ echo "@@end"
     try {
       rdmaLinks = (JSON.parse((parts.rdma ?? "").trim() || "[]") as any[]).map((l) => ({ dev: String(l.ifname), port: String(l.port), state: String(l.state), netdev: String(l.netdev ?? "") }));
     } catch { rdmaLinks = []; }
+    if (!rdmaLinks.length && parts.rdmasys) {
+      for (const l of parts.rdmasys.split("\n")) {
+        const [dev, port, state, netdev] = l.split("\t");
+        if (dev && port) rdmaLinks.push({ dev, port, state: (state ?? "").trim(), netdev: (netdev ?? "").trim() });
+      }
+    }
     const rdmaNodeTypes: Record<string, "iwarp" | "ib-roce" | "unknown"> = {};
     for (const l of (parts.nodetypes ?? "").split("\n")) {
       const [dev, t] = l.split("\t");
@@ -154,12 +172,13 @@ echo "@@end"
     const backup = `${NFS_CONF}.bak-${stamp}`;
     const cp = await run(this.server, '[ ! -f "$1" ] || cp -a -- "$1" "$2"', [NFS_CONF, backup]);
     if (cp.code !== 0) throw new Error(`Copie de sauvegarde impossible (${backup}) : ${cp.err.trim() || "code " + cp.code} — nfs.conf non modifié`);
+    const content = text.endsWith("\n") ? text : text + "\n";
     const file = new File(this.server, NFS_CONF);
     await unwrap(
       file.exists({ superuser: "try" }).andThen((exists) =>
         exists
-          ? file.replace(text, { superuser: "try" })
-          : file.create(true, { superuser: "try" }).andThen((f) => f.replace(text, { superuser: "try" }))
+          ? file.replace(content, { superuser: "try" })
+          : file.create(true, { superuser: "try" }).andThen((f) => f.replace(content, { superuser: "try" }))
       )
     );
     return backup;

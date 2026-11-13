@@ -44,6 +44,11 @@ suite("nfs.conf", () => {
     expect(t.indexOf("rdma=y")).toBeLessThan(t.indexOf("[mountd]"));
     const t2 = setNfsConf(sample, "lockd", "port", "32803");
     expect(t2).toMatch(/\[lockd\]\nport=32803/);
+    // ne déborde pas après un bloc de commentaires précédant la section suivante
+    const withSep = "[nfsd]\nvers4.1=y ; commentaire\n#\n# Section mountd\n#\n[mountd]\nport=20048\n";
+    expect(getNfsConf(withSep, "nfsd", "vers4.1")).toBe("y");
+    const t3 = setNfsConf(withSep, "nfsd", "rdma", "y");
+    expect(t3.indexOf("rdma=y")).toBeLessThan(t3.indexOf("# Section mountd"));
   });
   test("suppression = retour au défaut (commenté)", () => {
     const t = setNfsConf(sample, "nfsd", "vers4.1", undefined);
@@ -177,6 +182,16 @@ suite("NFSv3 : datasets enfants", () => {
   });
   test("ligne d'export : fsid remplacé partout", () => {
     expect(exportLineFor(exp("/a", "fsid=1,ro", [["h", "rw,fsid=2"]]), "/a b", "X")).toBe('"/a b" -ro,fsid=X h(rw)');
+    expect(exportLineFor(exp("/a", "ro", []), "/a", "X")).toBe("/a -ro,fsid=X *");
+  });
+  test("datasets non montés (none/legacy) ignorés et dédoublonnés", () => {
+    const r = analyzeExportV3(
+      exp("/", "rw", [["*", ""]]),
+      [{ name: "tank/unmounted", mountpoint: "none" }, { name: "tank/leg", mountpoint: "legacy" }, { name: "tank/a", mountpoint: "/tank/a" }, { name: "tank/a2", mountpoint: "/tank/a/" }],
+      ["/"],
+      () => "u1"
+    );
+    expect(r.suggestedLines).toEqual(["/tank/a -rw,fsid=u1 *"]);
   });
   test("async et sec=sys signalés", () => {
     const r = analyzeExportV3(exp("/tank/x", "", [["*", "rw,async"]]), [], []);
