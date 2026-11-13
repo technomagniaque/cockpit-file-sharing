@@ -184,6 +184,15 @@ suite("NFSv3 : datasets enfants", () => {
     expect(exportLineFor(exp("/a", "fsid=1,ro", [["h", "rw,fsid=2"]]), "/a b", "X")).toBe('"/a b" -ro,fsid=X h(rw)');
     expect(exportLineFor(exp("/a", "ro", []), "/a", "X")).toBe("/a -ro,fsid=X *");
   });
+  test("export sans client signalé comme ouvert à tous", () => {
+    const r = analyzeExportV3(exp("/tank", "rw", []), [{ name: "tank/a", mountpoint: "/tank/a" }], ["/tank"], () => "u1");
+    expect(r.suggestedLines).toEqual(["/tank/a -rw,fsid=u1 *"]);
+    const w = r.findings.find((f) => f.title === "Export sans client : ouvert à tous");
+    expect(w?.level).toBe("warning");
+    expect(w?.detail).toContain("lignes proposées");
+    const ok = analyzeExportV3(exp("/tank", "rw", [["192.168.0.0/24", ""]]), [], ["/tank"]);
+    expect(ok.findings.some((f) => f.title.startsWith("Export sans client"))).toBe(false);
+  });
   test("datasets non montés (none/legacy) ignorés et dédoublonnés", () => {
     const r = analyzeExportV3(
       exp("/", "rw", [["*", ""]]),

@@ -585,7 +585,11 @@ function normDir(p: string): string {
   return ("/" + p).replace(/\/+/g, "/").replace(/\/$/, "") || "/";
 }
 
-/** Reconstruit une ligne d'export pour un autre chemin, fsid remplacé. */
+/**
+ * Reconstruit une ligne d'export pour un autre chemin, fsid remplacé.
+ * Sans client, exportfs exporte de toute façon à tous les hôtes : la ligne
+ * l'écrit explicitement (« * »), et analyzeExportV3 le signale en avertissement.
+ */
 export function exportLineFor(e: NFSExport, path: string, fsid: string): string {
   const swapFsid = (opts: string) => {
     const list = splitOptions(opts).filter((o) => !o.startsWith("fsid="));
@@ -632,6 +636,15 @@ export function analyzeExportV3(e: NFSExport, children: ZfsChild[], exportedPath
     for (const c of missing) suggestedLines.push(exportLineFor(e, c.mountpoint, uuid()));
   } else if (under.length) {
     findings.push({ level: "info", title: "Datasets enfants exportés", detail: `${under.length} dataset(s) enfant(s), tous exportés explicitement.` });
+  }
+  if (!e.clients.length) {
+    findings.push({
+      level: "warning",
+      title: "Export sans client : ouvert à tous",
+      detail: `${root} n'a aucun client défini : exportfs l'exporte alors à tous les hôtes joignables (« * »)${suggestedLines.length ? ", et les lignes proposées ci-dessous aussi" : ""}. Avec AUTH_SYS, n'importe quel hôte du réseau peut monter le partage et se présenter sous n'importe quel UID.`,
+      fix: "Ajouter les clients autorisés (ex. 192.168.0.0/24 ou des hôtes nommés) à l'export, puis régénérer les lignes.",
+      ref: "exports(5) ; exportfs : « No host name given … suggest *(…) to avoid warning »",
+    });
   }
   const sets = allOptionSets(e);
   if (sets.some((o) => has(o, "async"))) findings.push({ level: "warning", title: "async avec NFSv3", detail: "En v3 le client compte sur COMMIT pour la durabilité ; async fait mentir le serveur et une coupure perd des écritures déjà « validées ».", fix: "sync (ZFS + SLOG)." });
