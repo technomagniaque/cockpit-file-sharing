@@ -184,7 +184,7 @@ const envIssues = computed(() => {
   if (!p) return [];
   const out: string[] = [];
   if (p.smbServerBuilt === "n") out.push(`Le noyau ${p.kernel} n'a pas CONFIG_SMB_SERVER : ksmbd indisponible.`);
-  if (!p.moduleAvailable && p.smbServerBuilt !== "y") out.push("Module ksmbd introuvable (modinfo ksmbd). Sous Debian 13 (Trixie, noyau 6.12 LTS), il est fourni par linux-image-amd64 : vérifiez que /lib/modules/$(uname -r) correspond au noyau actif.");
+  if (!p.moduleAvailable && p.smbServerBuilt !== "y") out.push(`Module ksmbd introuvable pour le noyau actif ${p.kernel} (modinfo ksmbd) : vérifiez que les modules de ce noyau sont installés (/lib/modules/${p.kernel}) — paquet linux-image-* de Debian, ou paquet du noyau tiers (XanMod…), dont la configuration doit activer CONFIG_SMB_SERVER.`);
   if (!p.toolsInstalled) out.push("ksmbd-tools absent (ksmbd.mountd introuvable : apt install ksmbd-tools).");
   if (p.sambaRunning) out.push("Samba est actif : arrêtez smb/smbd avant de démarrer ksmbd (port 445).");
   if (p.smbdirectBuilt === "n") out.push("CONFIG_SMB_SERVER_SMBDIRECT absent : pas de RDMA possible avec ce noyau.");
