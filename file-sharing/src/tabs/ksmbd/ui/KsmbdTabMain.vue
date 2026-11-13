@@ -9,7 +9,7 @@ import SambaConversion from "./SambaConversion.vue";
 import SmbDialects from "./SmbDialects.vue";
 import { KsmbdManager, type KsmbdProbe } from "../ksmbd-manager";
 import { smbDirectSgeIssues, SMB_DIRECT_MIN_SEND_SGE } from "../rdma-sge";
-import { parseIni, serializeIni, findSection, type IniDocument } from "../ini";
+import { parseIni, serializeIni, findSection, shareNameError, type IniDocument } from "../ini";
 import type { UserDb } from "../permission-stack";
 import { NFSv4Manager, type NfsServerSnapshot } from "@/tabs/nfs/nfsv4-manager";
 import { configuredVersions, effectiveNfsConf } from "@/tabs/nfs/nfsv4";
@@ -35,6 +35,7 @@ const probe = ref<KsmbdProbe | null>(null);
 const db = ref<UserDb>({ ksmbdUsers: [], unixUsers: {}, groups: {} });
 const selectedShare = ref("");
 const newShareName = ref("");
+const newShareError = ref("");
 const busy = ref(false);
 const view = ref<"config" | "simulator" | "convert">("config");
 const needsRestart = ref(false);
@@ -164,7 +165,9 @@ async function restartKsmbd() {
 
 function addShare() {
   const name = newShareName.value.trim();
-  if (!name || findSection(doc.value, name)) return;
+  const err = shareNameError(name, doc.value.sections.map((s) => s.name));
+  newShareError.value = err ?? "";
+  if (err) return;
   doc.value.sections.push({ name, flavor: "ksmbd", entries: [{ key: "path", value: "" }, { key: "read only", value: "no" }] });
   selectedShare.value = name;
   newShareName.value = "";
@@ -262,6 +265,7 @@ const envIssues = computed(() => {
           </button>
           <input v-model="newShareName" class="input-textlike w-40" placeholder="nouveau partage" @keyup.enter="addShare" />
           <button class="btn btn-secondary" @click="addShare">Ajouter</button>
+          <span v-if="newShareError" class="text-xs text-danger">Nom refusé : {{ newShareError }}</span>
         </div>
         <template v-if="share">
           <div class="flex justify-between items-center mb-2">

@@ -143,12 +143,41 @@ export function deleteValue(section: IniSection, key: string): void {
   section.entries = section.entries.filter((e) => keyNorm(e.key, section.flavor) !== n);
 }
 
+/** ksmbd-tools : nom de partage dans un champ de 64 octets, NUL compris (KSMBD_REQ_MAX_SHARE_NAME). */
+export const KSMBD_MAX_SHARE_NAME_BYTES = 63;
+/** Sections que ksmbd traite à part : on ne crée pas de partage sous ces noms. */
+export const RESERVED_SHARE_NAMES = ["global", "ipc$"];
+
+/**
+ * Raison pour laquelle un nom de partage est refusé, ou undefined s'il est valide :
+ * vide, réservé, déjà pris (casse ignorée, comme ksmbd), trop long, ou contenant
+ * un caractère qui casserait le fichier ([ ] ; # = saut de ligne…) ou interdit
+ * dans un nom de partage SMB (\ / : * ? " < > |).
+ */
+export function shareNameError(name: string, existing: string[] = []): string | undefined {
+  if (!name.trim()) return "nom vide";
+  if (name !== name.trim()) return "pas d'espace au début ni à la fin";
+  const low = name.toLowerCase();
+  if (RESERVED_SHARE_NAMES.includes(low)) return `« ${name} » est réservé par ksmbd`;
+  if (existing.some((e) => e.toLowerCase() === low)) return `le partage « ${name} » existe déjà (casse ignorée)`;
+  if (new TextEncoder().encode(name).length > KSMBD_MAX_SHARE_NAME_BYTES) return `trop long (${KSMBD_MAX_SHARE_NAME_BYTES} octets au plus)`;
+  // eslint-disable-next-line no-control-regex
+  const bad = /[\x00-\x1f\x7f[\];#=\\/:*?"<>|]/.exec(name);
+  if (bad) return `caractère interdit : ${JSON.stringify(bad[0])}`;
+  return undefined;
+}
+
+/** Une seule ligne : un saut de ligne dans un nom, une clé ou une valeur injecterait une directive ou une section. */
+function oneLine(s: string): string {
+  return s.replace(/[\r\n]+/g, " ");
+}
+
 export function serializeIni(doc: IniDocument, header: string[] = []): string {
-  const out: string[] = header.map((h) => `; ${h}`.trimEnd());
+  const out: string[] = header.map((h) => `; ${oneLine(h)}`.trimEnd());
   if (out.length) out.push("");
   for (const s of doc.sections) {
-    out.push(`[${s.name}]`);
-    for (const e of s.entries) out.push(`\t${e.key} = ${e.value}`);
+    out.push(`[${oneLine(s.name)}]`);
+    for (const e of s.entries) out.push(`\t${oneLine(e.key)} = ${oneLine(e.value)}`);
     out.push("");
   }
   return out.join("\n");
